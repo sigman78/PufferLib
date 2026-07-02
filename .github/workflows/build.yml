@@ -84,8 +84,29 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: "12.8.0"
-          method: network
+          method: local
           sub-packages: '["nvcc", "cudart", "cublas_dev", "cublas", "cusolver_dev", "cusolver", "curand_dev", "curand", "nvml_dev", "profiler_api"]'
+
+      - name: Collect CUDA install logs on failure
+        # The action only uploads installer logs on Linux; on Windows the
+        # NVIDIA installer writes its own logs under %TEMP%, so grab those
+        # manually to diagnose silent-install failures.
+        if: failure()
+        shell: pwsh
+        run: |
+          $dest = "cuda-install-logs"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Get-ChildItem -Path "$env:TEMP" -Recurse -Include *.log -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'NVIDIA|CUDA' } |
+            Copy-Item -Destination $dest -ErrorAction SilentlyContinue
+
+      - name: Upload CUDA install logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-install-logs
+          path: cuda-install-logs
+          if-no-files-found: ignore
 
       - name: Install python build deps
         run: pip install pybind11 numpy ninja
