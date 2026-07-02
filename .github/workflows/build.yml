@@ -118,6 +118,12 @@ jobs:
           key: cudnn-redist-windows-9.23.2.1
 
       - name: Build CUDA extension (breakout, sm_89)
+        # windows-latest ships only the newest MSVC v143 toolset (no
+        # side-by-side older versions to pin via msvc-dev-cmd), and nvcc
+        # 12.8 rejects it as an unrecognized host compiler version. The ABI
+        # is compatible in practice (same v143 toolset family); use nvcc's
+        # own override rather than depending on an older toolset being
+        # present on the runner.
         run: |
-          cmake --preset windows-cuda -DENV=breakout -DPUFFER_FETCH_CUDNN=ON -DCMAKE_CUDA_ARCHITECTURES=89
+          cmake --preset windows-cuda -DENV=breakout -DPUFFER_FETCH_CUDNN=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler
           cmake --build --preset windows-cuda
