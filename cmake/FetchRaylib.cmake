@@ -36,11 +36,27 @@ else()
     set(_raylib_dir "${raylib_bin_SOURCE_DIR}")
 endif()
 
+# The prebuilt Linux/macOS archives ship both static (.a) and shared
+# (.so/.dylib) builds; CMake's default suffix search order prefers shared
+# libraries, so an unqualified NAMES match would silently pick the .so and
+# leave the extension with an unresolvable runtime dependency. Restrict to
+# the static suffix everywhere except Windows, where the static lib is
+# simply named raylib.lib (no shared-lib name clash).
+if(NOT WIN32)
+    set(_raylib_saved_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+endif()
+
 find_library(PUFFER_RAYLIB_LIBRARY
     NAMES raylib libraylib.a
     PATHS "${_raylib_dir}/lib"
     NO_DEFAULT_PATH
 )
+
+if(NOT WIN32)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_raylib_saved_suffixes}")
+endif()
+
 if(NOT PUFFER_RAYLIB_LIBRARY OR NOT EXISTS "${_raylib_dir}/include/raylib.h")
     message(FATAL_ERROR "raylib not found under ${_raylib_dir} (expected include/raylib.h and lib/)")
 endif()
