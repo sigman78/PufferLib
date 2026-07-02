@@ -68,8 +68,14 @@ jobs:
     # Compile-only check of the CUDA extension (no GPU on hosted runners).
     # continue-on-error until proven stable: the CUDA toolkit install and the
     # cuDNN redist download are heavyweight moving parts.
+    #
+    # Pinned to windows-2022 rather than windows-latest: the NVIDIA installer
+    # for CUDA 12.8.0 aborts silently (~3s in, no logged error, exit code
+    # 0xE0E00019) on newer runner images windows-latest has drifted to. This
+    # is a known failure mode for this action - see
+    # https://github.com/Jimver/cuda-toolkit/issues/382.
     name: windows cmake (cuda extension, compile only)
-    runs-on: windows-latest
+    runs-on: windows-2022
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
