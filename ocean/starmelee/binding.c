@@ -22,6 +22,12 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     if (num_ships < 1) num_ships = 1;
     if (num_ships > STARMELEE_MAX_SHIPS) num_ships = STARMELEE_MAX_SHIPS;
 
+    if (total_agents % num_buffers != 0) {
+        fprintf(stderr,
+            "starmelee: num_buffers (%d) must divide total_agents (%d)\n",
+            num_buffers, total_agents);
+        exit(1);
+    }
     if (total_agents % num_ships != 0 || agents_per_buffer % num_ships != 0) {
         fprintf(stderr,
             "starmelee: num_ships (%d) must divide both total_agents (%d) and "
@@ -83,6 +89,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->fire_reward = (float)dict_get(kwargs, "fire_reward")->value;
     env->cycle_reward = (float)dict_get(kwargs, "cycle_reward")->value;
     env->targeted_penalty = (float)dict_get(kwargs, "targeted_penalty")->value;
+    env->shot_damage = (float)dict_get(kwargs, "shot_damage")->value;
     env->duel_spawn_frac = (float)dict_get(kwargs, "duel_spawn_frac")->value;
     env->trait_variation = (float)dict_get(kwargs, "trait_variation")->value;
     env->reengage_ticks = (int)dict_get(kwargs, "reengage_ticks")->value;

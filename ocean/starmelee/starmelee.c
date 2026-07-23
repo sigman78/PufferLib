@@ -80,6 +80,7 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "fire_reward") == 0) env->fire_reward = value;
         else if (strcmp(key, "cycle_reward") == 0) env->cycle_reward = value;
         else if (strcmp(key, "targeted_penalty") == 0) env->targeted_penalty = value;
+        else if (strcmp(key, "shot_damage") == 0) env->shot_damage = value;
         else if (strcmp(key, "duel_spawn_frac") == 0) env->duel_spawn_frac = value;
         else if (strcmp(key, "trait_variation") == 0) env->trait_variation = value;
         else if (strcmp(key, "reengage_ticks") == 0) env->reengage_ticks = (int)value;

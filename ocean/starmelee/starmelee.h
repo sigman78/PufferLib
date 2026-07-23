@@ -69,6 +69,7 @@ typedef struct {
     int full_cycles;
     int retreats;
     float prev_enemy_dist;       // < 0 until first combat tick
+    unsigned char just_finished; // episode ended this decision window
     int fire_flash;              // render-only muzzle flash countdown
     // Per-spawn trait multipliers (1.0 +- trait_variation), observable by
     // the ship itself so the shared policy can act on its own build
@@ -125,6 +126,7 @@ typedef struct {
     float fire_reward;       // completing an aim pass
     float cycle_reward;      // completing the disengage
     float targeted_penalty;  // charged to the ship that got fired at
+    float shot_damage;       // hp a completed pass takes off the victim
     float duel_spawn_frac;   // spawn separation as a fraction of size
     float trait_variation;   // +- range of per-spawn trait multipliers, 0..0.5
     int reengage_ticks;      // REGROUP cooldown after a disengage
@@ -213,16 +215,23 @@ void c_init(StarMelee* env) {
     if (env->action_repeat > 8) env->action_repeat = 8;
 
     if (env->attack_range_min <= 0.0f) env->attack_range_min = 4.0f * env->ship_radius;
+    // Ordering matters: cap max below the disengage cap so the chain
+    // min < max < disengage <= 0.45*size always holds afterwards
+    env->attack_range_max = fminf(env->attack_range_max, 0.40f * env->size);
     if (env->attack_range_max <= env->attack_range_min) {
-        env->attack_range_max = 2.5f * env->attack_range_min;
+        env->attack_range_max = fminf(2.5f * env->attack_range_min, 0.40f * env->size);
+        env->attack_range_min = fminf(env->attack_range_min, 0.5f * env->attack_range_max);
     }
     env->aim_cone = sm_clampf(env->aim_cone, 0.0f, 1.0f);
     if (env->aim_cone == 0.0f) env->aim_cone = 0.15f;
     if (env->aim_ticks < 1) env->aim_ticks = 30;
-    if (env->disengage_range <= env->attack_range_max) {
-        env->disengage_range = 2.0f * env->attack_range_max;
-    }
     env->disengage_range = fminf(env->disengage_range, 0.45f * env->size);
+    if (env->disengage_range <= env->attack_range_max) {
+        env->disengage_range = fminf(2.0f * env->attack_range_max, 0.45f * env->size);
+        if (env->disengage_range <= env->attack_range_max) {
+            env->disengage_range = 0.5f * (env->attack_range_max + 0.45f * env->size);
+        }
+    }
     if (env->engage_scale == 0.0f) env->engage_scale = 2.0f;
     if (env->aim_reward < 0.0f) env->aim_reward = 0.0f;
     if (env->strafe_reward < 0.0f) env->strafe_reward = 0.0f;
@@ -237,6 +246,10 @@ void c_init(StarMelee* env) {
     if (env->loiter_reward < 0.0f) env->loiter_reward = 0.0f;
     env->retreat_hp_frac = sm_clampf(env->retreat_hp_frac, 0.0f, 0.9f);
     if (env->hp_regen < 0.0f) env->hp_regen = 0.0f;
+    // Regen is RETREAT's only exit; without it ships would lock into
+    // retreat forever and farm loiter_reward from hiding
+    if (env->retreat_hp_frac > 0.0f && env->hp_regen == 0.0f) env->hp_regen = 0.1f;
+    if (env->shot_damage < 0.0f) env->shot_damage = 0.0f;
 }
 
 static inline float sm_trait(StarMelee* env) {
@@ -416,11 +429,12 @@ void compute_observations(StarMelee* env) {
         obs[3] = pdx / half;
         obs[4] = pdy / half;
         obs[5] = pdist / half_diag;
-        obs[6] = s->vx / env->max_speed;
-        obs[7] = s->vy / env->max_speed;
+        // Normalize by this build's own limits so ranges stay nominal
+        obs[6] = s->vx / (env->max_speed * s->t_speed);
+        obs[7] = s->vy / (env->max_speed * s->t_speed);
         obs[8] = cosf(s->heading);
         obs[9] = sinf(s->heading);
-        obs[10] = s->omega / env->max_turn_rate;
+        obs[10] = s->omega / (env->max_turn_rate * s->t_turn);
         obs[11] = s->hp / env->hp_max;
         obs[12] = (float)s->episode_tick / (float)env->max_ticks;
 
@@ -457,7 +471,8 @@ void compute_observations(StarMelee* env) {
                 obs[23] = (float)o->aim_progress / (float)env->aim_ticks;
                 obs[24] = cosf(o->heading);
                 obs[25] = sinf(o->heading);
-                obs[26] = (float)s->reengage_timer / (float)env->reengage_ticks;
+                obs[26] = s->attack_state == SM_STATE_REGROUP
+                    ? (float)s->reengage_timer / (float)env->reengage_ticks : 0.0f;
                 obs[32] = o->hp / env->hp_max;  // smell blood: press a wounded enemy
             } else {
                 for (int k = 18; k < 27; k++) obs[k] = 0.0f;
@@ -514,6 +529,15 @@ static void sm_finish_ship(StarMelee* env, int i, float reward, unsigned char re
     s->last_result = result;
     sm_add_log(env, s, result);
     sm_spawn_ship(env, i);
+    env->ships[i].just_finished = 1;
+    // The respawn teleports this ship: opponents must re-baseline their
+    // distance shaping and drop any aim lock, or the jump mints phantom
+    // shaping/cycle rewards for them.
+    for (int j = 0; j < env->num_ships; j++) {
+        if (j == i) continue;
+        env->ships[j].prev_enemy_dist = -1.0f;
+        env->ships[j].aim_progress = 0;
+    }
     if (IsWindowReady()) {
         env->ships[i].event_timer = 70;
         env->ships[i].last_result = result;
@@ -543,7 +567,8 @@ static void sm_combat_tick(StarMelee* env, int i) {
     float dx = sm_wrap_delta(e->x - s->x, env->size);
     float dy = sm_wrap_delta(e->y - s->y, env->size);
     float dist = sqrtf(dx*dx + dy*dy);
-    float r = 0.0f;
+    float r = env->step_penalty;  // duels feel time pressure too
+    float next_prev = dist;       // next tick's shaping baseline
 
     // Low hp overrides everything: break off and survive. Hysteresis (exit
     // well above the entry threshold) stops flapping at the boundary.
@@ -587,24 +612,29 @@ static void sm_combat_tick(StarMelee* env, int i) {
                 s->attack_state = SM_STATE_FLEE;
                 s->fire_flash = 14;
                 // Getting shot at teaches evasion and planet-shielding;
-                // cautious builds feel it more and should expose themselves less
+                // cautious builds feel it more and should expose themselves
+                // less. Real hp damage keeps the exchange from being
+                // positive-sum for the pair: pure reward stings made
+                // cooperative shot-feeding the self-play optimum.
                 float sting = env->targeted_penalty * e->t_caution;
                 env->rewards[j] -= sting;
                 e->episode_return -= sting;
+                e->hp -= env->shot_damage * e->t_fragility;
             }
         } else if (s->aim_progress > 0) {
             s->aim_progress -= 1;
         }
     } else if (s->attack_state == SM_STATE_FLEE) {
-        // FLEE: you are the target now, open distance fast
+        // FLEE: you are the target now, open distance fast. The prev-dist
+        // gate keeps an opponent-respawn teleport from completing a cycle.
         if (s->prev_enemy_dist >= 0.0f) {
             r += env->engage_scale * (dist - s->prev_enemy_dist) / env->size;
-        }
-        if (dist >= env->disengage_range) {
-            r += env->cycle_reward;
-            s->full_cycles += 1;
-            s->attack_state = SM_STATE_REGROUP;
-            s->reengage_timer = env->reengage_ticks;
+            if (dist >= env->disengage_range) {
+                r += env->cycle_reward;
+                s->full_cycles += 1;
+                s->attack_state = SM_STATE_REGROUP;
+                s->reengage_timer = env->reengage_ticks;
+            }
         }
     } else if (s->attack_state == SM_STATE_REGROUP) {
         // REGROUP: weapons cooling down; loiter out wide before re-engaging
@@ -614,6 +644,9 @@ static void sm_combat_tick(StarMelee* env, int i) {
         }
         if (s->reengage_timer <= 0) {
             s->attack_state = SM_STATE_APPROACH;
+            // Approach shaping only pays for the disengage_range -> band leg;
+            // wandering far during the free cooldown must not refill the well
+            next_prev = fminf(dist, env->disengage_range);
         }
     } else {
         // RETREAT: wounded, escape shaping only until hp recovers
@@ -625,7 +658,11 @@ static void sm_combat_tick(StarMelee* env, int i) {
         }
         float retreat_exit = fminf(env->retreat_hp_frac + 0.15f, 1.0f) * env->hp_max;
         if (s->hp >= retreat_exit) {
-            s->attack_state = SM_STATE_APPROACH;
+            // Resume an interrupted weapons cooldown instead of skipping it
+            s->attack_state = s->reengage_timer > 0 ? SM_STATE_REGROUP : SM_STATE_APPROACH;
+            if (s->attack_state == SM_STATE_APPROACH) {
+                next_prev = fminf(dist, env->disengage_range);
+            }
         }
     }
 
@@ -634,7 +671,7 @@ static void sm_combat_tick(StarMelee* env, int i) {
         s->hp = fminf(env->hp_max, s->hp + env->hp_regen);
     }
 
-    s->prev_enemy_dist = dist;
+    s->prev_enemy_dist = next_prev;
     env->rewards[i] += r;
     s->episode_return += r;
 }
@@ -709,7 +746,7 @@ static void sm_physics_tick(StarMelee* env) {
 
         // Safety cap + configurable bleed keeps slingshots bounded
         float speed = sqrtf(s->vx*s->vx + s->vy*s->vy);
-        float hard_cap = 2.0f * env->max_speed;
+        float hard_cap = 2.0f * env->max_speed * s->t_speed;
         if (speed > hard_cap) {
             s->vx *= hard_cap / speed;
             s->vy *= hard_cap / speed;
@@ -748,7 +785,9 @@ static void sm_physics_tick(StarMelee* env) {
             float damage = env->damage_scale * -vn * s->t_fragility;
             s->hp -= damage;
             s->planet_hits += 1;
-            float pain = -damage / env->hp_max;
+            // Pain cap: a terminal step already adds -1, and the trainer
+            // clamps steps to [-1, 1]; uncapped pain just gets truncated
+            float pain = -fminf(damage, 0.6f * env->hp_max) / env->hp_max;
             env->rewards[i] += pain;
             s->episode_return += pain;
         }
@@ -794,6 +833,11 @@ static void sm_physics_tick(StarMelee* env) {
     for (int i = 0; i < n; i++) {
         Ship* s = &env->ships[i];
 
+        // A ship that finished its episode earlier in this action_repeat
+        // window flies on, but the new episode must not leak rewards or a
+        // second terminal into the already-terminated training step
+        if (s->just_finished) continue;
+
         if (s->hp <= 0.0f) {
             sm_finish_ship(env, i, -1.0f, SM_RESULT_CRASH);
             continue;
@@ -827,6 +871,9 @@ void c_step(StarMelee* env) {
     for (int i = 0; i < env->num_ships; i++) {
         env->rewards[i] = 0.0f;
         env->terminals[i] = 0.0f;
+    }
+    for (int i = 0; i < env->num_ships; i++) {
+        env->ships[i].just_finished = 0;
     }
     sm_read_inputs(env);
     for (int rep = 0; rep < env->action_repeat; rep++) {
