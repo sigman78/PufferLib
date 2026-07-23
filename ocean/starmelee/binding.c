@@ -96,6 +96,12 @@ void my_init(Env* env, Dict* kwargs) {
     env->loiter_reward = (float)dict_get(kwargs, "loiter_reward")->value;
     env->retreat_hp_frac = (float)dict_get(kwargs, "retreat_hp_frac")->value;
     env->hp_regen = (float)dict_get(kwargs, "hp_regen")->value;
+    env->num_asteroids = (int)dict_get(kwargs, "num_asteroids")->value;
+    env->asteroid_radius = (float)dict_get(kwargs, "asteroid_radius")->value;
+    env->asteroid_damage = (float)dict_get(kwargs, "asteroid_damage")->value;
+    env->asteroid_speed_min = (float)dict_get(kwargs, "asteroid_speed_min")->value;
+    env->asteroid_speed_max = (float)dict_get(kwargs, "asteroid_speed_max")->value;
+    env->asteroid_respawn_ticks = (int)dict_get(kwargs, "asteroid_respawn_ticks")->value;
     c_init(env);
 }
 
@@ -113,4 +119,5 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "attack_passes", log->attack_passes);
     dict_set(out, "full_cycles", log->full_cycles);
     dict_set(out, "retreats", log->retreats);
+    dict_set(out, "asteroid_hits", log->asteroid_hits);
 }

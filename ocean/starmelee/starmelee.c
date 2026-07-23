@@ -87,6 +87,12 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "loiter_reward") == 0) env->loiter_reward = value;
         else if (strcmp(key, "retreat_hp_frac") == 0) env->retreat_hp_frac = value;
         else if (strcmp(key, "hp_regen") == 0) env->hp_regen = value;
+        else if (strcmp(key, "num_asteroids") == 0) env->num_asteroids = (int)value;
+        else if (strcmp(key, "asteroid_radius") == 0) env->asteroid_radius = value;
+        else if (strcmp(key, "asteroid_damage") == 0) env->asteroid_damage = value;
+        else if (strcmp(key, "asteroid_speed_min") == 0) env->asteroid_speed_min = value;
+        else if (strcmp(key, "asteroid_speed_max") == 0) env->asteroid_speed_max = value;
+        else if (strcmp(key, "asteroid_respawn_ticks") == 0) env->asteroid_respawn_ticks = (int)value;
     }
     fclose(f);
     return 1;

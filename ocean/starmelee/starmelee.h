@@ -10,8 +10,9 @@
 #include <string.h>
 #include "raylib.h"
 
-#define STARMELEE_OBS_SIZE 34
+#define STARMELEE_OBS_SIZE 39
 #define STARMELEE_MAX_SHIPS 8
+#define STARMELEE_MAX_ASTEROIDS 8
 #define STARMELEE_TRAIL_LEN 48
 
 const unsigned char SM_STATE_APPROACH = 0;
@@ -38,8 +39,29 @@ typedef struct {
     float attack_passes;  // combat: completed aim-and-fire passes
     float full_cycles;    // combat: fire followed by clean disengage
     float retreats;       // combat: times low hp forced a retreat
+    float asteroid_hits;  // asteroid impacts taken
     float n;
 } Log;
+
+// Straight-line hazard: deliberately ignores gravity, disintegrates on any
+// contact (ship or planet) and respawns later with a fresh trajectory
+typedef struct {
+    float x;
+    float y;
+    float vx;
+    float vy;
+    float radius;
+    int active;
+    int respawn_timer;
+    // render-only rock outline, generated at spawn
+    Vector2 shape[10];
+    int num_vertices;
+    // render-only explosion at the disintegration point
+    float boom_x;
+    float boom_y;
+    float boom_radius;
+    int boom_timer;
+} Asteroid;
 
 typedef struct {
     float x;
@@ -56,6 +78,7 @@ typedef struct {
     int episode_tick;
     int planet_hits;
     int input_changes;
+    int asteroid_hits;
     unsigned char thrusting;
     unsigned char turning_left;
     unsigned char turning_right;
@@ -134,7 +157,16 @@ typedef struct {
     float retreat_hp_frac;   // hp fraction that forces RETREAT; 0 disables
     float hp_regen;          // hp per tick while beyond disengage_range
 
+    // asteroids (0 = off)
+    int num_asteroids;
+    float asteroid_radius;       // nominal; each spawn varies +-25%
+    float asteroid_damage;       // hp cost of an impact (scaled by fragility)
+    float asteroid_speed_min;
+    float asteroid_speed_max;    // clamped to max_speed / 2
+    int asteroid_respawn_ticks;  // delay before a destroyed rock returns
+
     Ship ships[STARMELEE_MAX_SHIPS];
+    Asteroid asteroids[STARMELEE_MAX_ASTEROIDS];
     unsigned int rng;
 
     // render-only state (untouched during training)
@@ -250,6 +282,22 @@ void c_init(StarMelee* env) {
     // retreat forever and farm loiter_reward from hiding
     if (env->retreat_hp_frac > 0.0f && env->hp_regen == 0.0f) env->hp_regen = 0.1f;
     if (env->shot_damage < 0.0f) env->shot_damage = 0.0f;
+
+    if (env->num_asteroids < 0) env->num_asteroids = 0;
+    if (env->num_asteroids > STARMELEE_MAX_ASTEROIDS) {
+        env->num_asteroids = STARMELEE_MAX_ASTEROIDS;
+    }
+    if (env->asteroid_radius <= 0.0f) env->asteroid_radius = 7.0f;
+    if (env->asteroid_damage < 0.0f) env->asteroid_damage = 20.0f;
+    // Spec: asteroids stay slower than half the ship top speed
+    float rock_cap = 0.5f * env->max_speed;
+    env->asteroid_speed_max = sm_clampf(env->asteroid_speed_max, 0.0f, rock_cap);
+    if (env->asteroid_speed_max == 0.0f) env->asteroid_speed_max = rock_cap;
+    env->asteroid_speed_min = sm_clampf(env->asteroid_speed_min, 0.0f, env->asteroid_speed_max);
+    if (env->asteroid_speed_min == 0.0f) {
+        env->asteroid_speed_min = 0.3f * env->asteroid_speed_max;
+    }
+    if (env->asteroid_respawn_ticks < 1) env->asteroid_respawn_ticks = 300;
 }
 
 static inline float sm_trait(StarMelee* env) {
@@ -373,6 +421,7 @@ static void sm_spawn_ship(StarMelee* env, int i) {
     s->episode_return = 0.0f;
     s->planet_hits = 0;
     s->input_changes = 0;
+    s->asteroid_hits = 0;
     s->thrusting = 0;
     s->turning_left = 0;
     s->turning_right = 0;
@@ -407,6 +456,100 @@ static void sm_spawn_ship(StarMelee* env, int i) {
         }
     }
     s->prev_goal_dist = sm_torus_dist(env, s->x, s->y, s->goal_x, s->goal_y);
+}
+
+// New rock: placed away from every ship and the planet, flying a straight
+// random line at a speed within [asteroid_speed_min, asteroid_speed_max]
+static void sm_spawn_asteroid(StarMelee* env, int k) {
+    Asteroid* a = &env->asteroids[k];
+    float ship_clearance = 0.2f * env->size;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        a->x = env->size * sm_randf(env);
+        a->y = env->size * sm_randf(env);
+        if (sm_torus_dist(env, a->x, a->y, sm_planet_x(env), sm_planet_y(env))
+                < env->planet_radius + env->asteroid_radius + 20.0f) {
+            continue;
+        }
+        int clear = 1;
+        for (int i = 0; i < env->num_ships; i++) {
+            if (sm_torus_dist(env, a->x, a->y, env->ships[i].x, env->ships[i].y)
+                    < ship_clearance) {
+                clear = 0;
+                break;
+            }
+        }
+        if (clear) break;
+    }
+    float ang = 2.0f * PI * sm_randf(env);
+    float speed = env->asteroid_speed_min
+        + (env->asteroid_speed_max - env->asteroid_speed_min) * sm_randf(env);
+    a->vx = speed * cosf(ang);
+    a->vy = speed * sinf(ang);
+    a->radius = env->asteroid_radius * (0.75f + 0.5f * sm_randf(env));
+    a->active = 1;
+    a->respawn_timer = 0;
+
+    // Rock outline (kept in the deterministic rng stream so training and
+    // rendering runs stay identical)
+    a->num_vertices = 8;
+    for (int v = 0; v < a->num_vertices; v++) {
+        float va = 2.0f * PI * v / a->num_vertices;
+        float vr = a->radius * (0.7f + 0.6f * sm_randf(env));
+        a->shape[v] = (Vector2){cosf(va) * vr, sinf(va) * vr};
+    }
+}
+
+static void sm_destroy_asteroid(StarMelee* env, int k) {
+    Asteroid* a = &env->asteroids[k];
+    a->active = 0;
+    a->respawn_timer = env->asteroid_respawn_ticks;
+    a->boom_x = a->x;
+    a->boom_y = a->y;
+    a->boom_radius = a->radius;
+    a->boom_timer = 12;
+}
+
+// One straight-line tick per rock, plus disintegration on planet or ship
+// contact. Ships hit take hp damage, a reward sting, and a momentum kick.
+static void sm_asteroids_tick(StarMelee* env) {
+    for (int k = 0; k < env->num_asteroids; k++) {
+        Asteroid* a = &env->asteroids[k];
+        if (!a->active) {
+            a->respawn_timer -= 1;
+            if (a->respawn_timer <= 0) {
+                sm_spawn_asteroid(env, k);
+            }
+            continue;
+        }
+
+        a->x = sm_wrap_pos(a->x + a->vx, env->size);
+        a->y = sm_wrap_pos(a->y + a->vy, env->size);
+
+        if (sm_torus_dist(env, a->x, a->y, sm_planet_x(env), sm_planet_y(env))
+                < env->planet_radius + a->radius) {
+            sm_destroy_asteroid(env, k);
+            continue;
+        }
+
+        for (int i = 0; i < env->num_ships; i++) {
+            Ship* s = &env->ships[i];
+            if (s->just_finished) continue;
+            if (sm_torus_dist(env, a->x, a->y, s->x, s->y)
+                    >= a->radius + env->ship_radius) {
+                continue;
+            }
+            float damage = env->asteroid_damage * s->t_fragility;
+            s->hp -= damage;
+            s->asteroid_hits += 1;
+            s->vx += 0.3f * a->vx;
+            s->vy += 0.3f * a->vy;
+            float pain = -fminf(damage, 0.6f * env->hp_max) / env->hp_max;
+            env->rewards[i] += pain;
+            s->episode_return += pain;
+            sm_destroy_asteroid(env, k);
+            break;
+        }
+    }
 }
 
 void compute_observations(StarMelee* env) {
@@ -490,6 +633,32 @@ void compute_observations(StarMelee* env) {
         obs[30] = s->t_fragility - 1.0f;
         obs[31] = s->t_caution - 1.0f;
         obs[33] = s->attack_state == SM_STATE_RETREAT ? 1.0f : 0.0f;
+
+        // Nearest active asteroid; rocks are dumb but they hurt
+        int rock = -1;
+        float rock_dist = 0.0f;
+        for (int k = 0; k < env->num_asteroids; k++) {
+            if (!env->asteroids[k].active) continue;
+            float d = sm_torus_dist(env, s->x, s->y, env->asteroids[k].x, env->asteroids[k].y);
+            if (rock < 0 || d < rock_dist) {
+                rock = k;
+                rock_dist = d;
+            }
+        }
+        if (rock >= 0) {
+            Asteroid* a = &env->asteroids[rock];
+            obs[34] = sm_wrap_delta(a->x - s->x, env->size) / half;
+            obs[35] = sm_wrap_delta(a->y - s->y, env->size) / half;
+            obs[36] = (a->vx - s->vx) / (2.0f * env->max_speed);
+            obs[37] = (a->vy - s->vy) / (2.0f * env->max_speed);
+            obs[38] = 1.0f;
+        } else {
+            obs[34] = 0.0f;
+            obs[35] = 0.0f;
+            obs[36] = 0.0f;
+            obs[37] = 0.0f;
+            obs[38] = 0.0f;
+        }
     }
 }
 
@@ -515,6 +684,7 @@ static void sm_add_log(StarMelee* env, Ship* s, unsigned char result) {
     env->log.attack_passes += (float)s->attack_passes;
     env->log.full_cycles += (float)s->full_cycles;
     env->log.retreats += (float)s->retreats;
+    env->log.asteroid_hits += (float)s->asteroid_hits;
     env->log.input_changes += s->episode_tick > 0
         ? (float)s->input_changes / (float)s->episode_tick : 0.0f;
     env->log.n += 1.0f;
@@ -549,6 +719,9 @@ void c_reset(StarMelee* env) {
         sm_spawn_ship(env, i);
         env->ships[i].last_result = SM_RESULT_NONE;
         env->ships[i].event_timer = 0;
+    }
+    for (int k = 0; k < env->num_asteroids; k++) {
+        sm_spawn_asteroid(env, k);
     }
     compute_observations(env);
 }
@@ -793,6 +966,8 @@ static void sm_physics_tick(StarMelee* env) {
         }
     }
 
+    sm_asteroids_tick(env);
+
     // Ship vs ship: equal masses, exchange normal velocity components
     for (int i = 0; i < n; i++) {
         for (int j = i + 1; j < n; j++) {
@@ -989,6 +1164,32 @@ static void sm_draw_ship_sprite(StarMelee* env, float sx, float sy, float scale,
     DrawTriangleLines(nose, lwing, rwing, SM_WHITE);
 }
 
+static void sm_draw_asteroid_sprite(StarMelee* env, float sx, float sy, float scale, int k) {
+    Asteroid* a = &env->asteroids[k];
+    for (int v = 0; v < a->num_vertices; v++) {
+        int w = (v + 1) % a->num_vertices;
+        DrawLineV((Vector2){sx + a->shape[v].x * scale, sy + a->shape[v].y * scale},
+                  (Vector2){sx + a->shape[w].x * scale, sy + a->shape[w].y * scale},
+                  (Color){170, 160, 150, 255});
+    }
+}
+
+// Basic disintegration burst: expanding fading ring plus radial shards
+static void sm_draw_boom_sprite(StarMelee* env, float sx, float sy, float scale, int k) {
+    Asteroid* a = &env->asteroids[k];
+    float t = 1.0f - a->boom_timer / 12.0f;  // 0 -> 1 over the burst
+    float alpha = 1.0f - t;
+    float r = a->boom_radius * scale * (1.0f + 2.5f * t);
+    DrawCircleLines((int)sx, (int)sy, r, Fade((Color){255, 160, 60, 255}, alpha));
+    DrawCircleLines((int)sx, (int)sy, r * 0.55f, Fade((Color){255, 220, 100, 255}, alpha * 0.8f));
+    for (int v = 0; v < 6; v++) {
+        float ang = 2.0f * PI * v / 6.0f + (float)k;
+        Vector2 from = {sx + cosf(ang) * r * 0.6f, sy + sinf(ang) * r * 0.6f};
+        Vector2 to = {sx + cosf(ang) * r * 1.25f, sy + sinf(ang) * r * 1.25f};
+        DrawLineV(from, to, Fade((Color){200, 190, 180, 255}, alpha));
+    }
+}
+
 static void sm_draw_goal_sprite(StarMelee* env, float sx, float sy, float scale, int i) {
     float r = env->goal_radius * scale;
     float pulse = 0.72f + 0.28f * sinf(GetTime() * 4.0f + i);
@@ -1049,6 +1250,18 @@ void c_render(StarMelee* env) {
                (int)(pc.y - env->planet_radius * scale * 0.25f),
                env->planet_radius * scale * 0.62f, Fade(SM_PLANET_DARK, 0.5f));
     DrawCircleLines((int)pc.x, (int)pc.y, env->planet_radius * scale, SM_WHITE);
+
+    for (int k = 0; k < env->num_asteroids; k++) {
+        if (env->asteroids[k].active) {
+            sm_draw_wrapped(env, env->asteroids[k].x, env->asteroids[k].y, 40.0f,
+                sm_draw_asteroid_sprite, k);
+        }
+        if (env->asteroids[k].boom_timer > 0) {
+            env->asteroids[k].boom_timer -= 1;
+            sm_draw_wrapped(env, env->asteroids[k].boom_x, env->asteroids[k].boom_y,
+                60.0f, sm_draw_boom_sprite, k);
+        }
+    }
 
     for (int i = 0; i < env->num_ships; i++) {
         Ship* s = &env->ships[i];
