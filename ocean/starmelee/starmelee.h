@@ -29,6 +29,7 @@ typedef struct {
     float timeout_rate;
     float final_distance;
     float planet_hits;
+    float input_changes;  // button toggles per step (jitter measure)
     float n;
 } Log;
 
@@ -46,6 +47,7 @@ typedef struct {
     float episode_return;
     int episode_tick;
     int planet_hits;
+    int input_changes;
     unsigned char thrusting;
     unsigned char turning_left;
     unsigned char turning_right;
@@ -83,6 +85,7 @@ typedef struct {
     float progress_scale;  // reward per (goal distance shrink / size)
     float spawn_clearance; // min spawn/beacon distance from the planet center
     float min_goal_frac;   // min spawn-to-beacon distance as a fraction of size
+    float input_change_penalty; // reward lost per button state change per step
 
     Ship ships[STARMELEE_MAX_SHIPS];
     unsigned int rng;
@@ -160,6 +163,7 @@ void c_init(StarMelee* env) {
     env->spawn_clearance = sm_clampf(env->spawn_clearance, min_clear, 0.45f * env->size);
     env->min_goal_frac = sm_clampf(env->min_goal_frac, 0.0f, 0.45f);
     if (env->min_goal_frac == 0.0f) env->min_goal_frac = 0.3f;
+    if (env->input_change_penalty < 0.0f) env->input_change_penalty = 0.0f;
 }
 
 // Gravity acceleration vector at (x, y), pointing toward the planet:
@@ -218,6 +222,7 @@ static void sm_spawn_ship(StarMelee* env, int i) {
     s->episode_tick = 0;
     s->episode_return = 0.0f;
     s->planet_hits = 0;
+    s->input_changes = 0;
     s->thrusting = 0;
     s->turning_left = 0;
     s->turning_right = 0;
@@ -301,6 +306,8 @@ static void sm_add_log(StarMelee* env, Ship* s, unsigned char result) {
     env->log.timeout_rate += result == SM_RESULT_TIMEOUT ? 1.0f : 0.0f;
     env->log.final_distance += s->prev_goal_dist / env->size;
     env->log.planet_hits += s->planet_hits;
+    env->log.input_changes += s->episode_tick > 0
+        ? (float)s->input_changes / (float)s->episode_tick : 0.0f;
     env->log.n += 1.0f;
 }
 
@@ -343,6 +350,18 @@ void c_step(StarMelee* env) {
         int left = env->actions[i*3 + 0] > 0.5f;
         int right = env->actions[i*3 + 1] > 0.5f;
         int engine = env->actions[i*3 + 2] > 0.5f;
+
+        // Jitter penalty: charge every button toggle so dithering (rapid
+        // on/off switching a human would never produce) costs reward while
+        // sustained holds stay free.
+        int changes = (left != s->turning_left) + (right != s->turning_right)
+            + (engine != s->thrusting);
+        if (changes > 0 && env->input_change_penalty > 0.0f) {
+            float jitter = env->input_change_penalty * (float)changes;
+            env->rewards[i] -= jitter;
+            s->episode_return -= jitter;
+        }
+        s->input_changes += changes;
         s->turning_left = (unsigned char)left;
         s->turning_right = (unsigned char)right;
         s->thrusting = (unsigned char)engine;

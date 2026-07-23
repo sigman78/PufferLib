@@ -66,6 +66,7 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "progress_scale") == 0) env->progress_scale = value;
         else if (strcmp(key, "spawn_clearance") == 0) env->spawn_clearance = value;
         else if (strcmp(key, "min_goal_frac") == 0) env->min_goal_frac = value;
+        else if (strcmp(key, "input_change_penalty") == 0) env->input_change_penalty = value;
     }
     fclose(f);
     return 1;

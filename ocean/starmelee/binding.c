@@ -69,6 +69,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->progress_scale = (float)dict_get(kwargs, "progress_scale")->value;
     env->spawn_clearance = (float)dict_get(kwargs, "spawn_clearance")->value;
     env->min_goal_frac = (float)dict_get(kwargs, "min_goal_frac")->value;
+    env->input_change_penalty = (float)dict_get(kwargs, "input_change_penalty")->value;
     c_init(env);
 }
 
@@ -82,4 +83,5 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "timeout_rate", log->timeout_rate);
     dict_set(out, "final_distance", log->final_distance);
     dict_set(out, "planet_hits", log->planet_hits);
+    dict_set(out, "input_changes", log->input_changes);
 }
