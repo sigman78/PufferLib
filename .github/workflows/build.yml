@@ -89,7 +89,7 @@ jobs:
         with:
           cuda: "12.8.0"
           method: local
-          sub-packages: '["nvcc", "cudart", "cublas_dev", "cublas", "cusolver_dev", "cusolver", "curand_dev", "curand", "nvml_dev", "cuda_profiler_api"]'
+          sub-packages: '["nvcc", "cudart", "cublas_dev", "cublas", "cusolver_dev", "cusolver", "curand_dev", "curand", "nvml_dev", "nvtx", "cuda_profiler_api"]'
 
       - name: Collect CUDA install logs on failure
         # The action only uploads installer logs on Linux; on Windows the
