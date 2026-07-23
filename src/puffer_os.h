@@ -105,6 +105,20 @@ static __inline int rand_r(unsigned int* seed) {
     return result;
 }
 
+// ---- rand()/srand()/RAND_MAX ----
+// UCRT rand() is 15-bit (RAND_MAX 0x7FFF) while the rand_r above emits glibc's
+// 31-bit range. Env code divides by RAND_MAX for both, so mixing the two
+// silently produces values up to ~65536x out of [0, 1] (spawns, headings, ...).
+// Route rand()/srand() through the same 31-bit generator and raise RAND_MAX to
+// glibc's value so every idiom stays consistent.
+static unsigned int _puffer_rand_state = 1u;
+static __inline void _puffer_srand(unsigned int seed) { _puffer_rand_state = seed; }
+static __inline int _puffer_rand(void) { return rand_r(&_puffer_rand_state); }
+#define srand _puffer_srand
+#define rand _puffer_rand
+#undef RAND_MAX
+#define RAND_MAX 0x7FFFFFFF
+
 // ---- clock_gettime() ----
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
