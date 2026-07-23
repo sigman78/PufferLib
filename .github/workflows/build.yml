@@ -69,7 +69,11 @@ jobs:
     # continue-on-error until proven stable: the CUDA toolkit install and the
     # cuDNN redist download are heavyweight moving parts.
     name: windows cmake (cuda extension, compile only)
-    runs-on: windows-latest
+    # Pinned to windows-2022: windows-latest now ships VS2026 (v14.5x), whose
+    # headers crash nvcc 12.8's cudafe++ with an access violation regardless
+    # of -allow-unsupported-compiler. windows-2022 has the VS2022 v143
+    # toolset that CUDA 12.x requires.
+    runs-on: windows-2022
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -118,12 +122,11 @@ jobs:
           key: cudnn-redist-windows-9.23.2.1
 
       - name: Build CUDA extension (breakout, sm_89)
-        # windows-latest ships only the newest MSVC v143 toolset (no
-        # side-by-side older versions to pin via msvc-dev-cmd), and nvcc
-        # 12.8 rejects it as an unrecognized host compiler version. The ABI
-        # is compatible in practice (same v143 toolset family); use nvcc's
-        # own override rather than depending on an older toolset being
-        # present on the runner.
+        # The windows-2022 image ships a v143 toolset newer than nvcc 12.8's
+        # official support window, so nvcc rejects it as unrecognized. The
+        # ABI is compatible in practice (same v143 toolset family); use
+        # nvcc's own override rather than depending on an older toolset
+        # being present on the runner.
         run: |
           cmake --preset windows-cuda -DENV=breakout -DPUFFER_FETCH_CUDNN=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler
           cmake --build --preset windows-cuda
