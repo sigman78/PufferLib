@@ -74,7 +74,20 @@ Windows notes:
   `blastar`, `convert`, `convert_circle`, `snake`, `whisker_racer`, and
   `matsci`/`shared_pool` need external libs (lammps, cpr).
 - POSIX shims live in `src/puffer_os.h` (pthreads, clock_gettime, rand_r,
-  usleep, aligned alloc, ...). It is force-included for env code on Windows.
+  rand/srand/RAND_MAX, usleep, aligned alloc, ...). It is force-included for
+  env code on Windows. Note UCRT's `RAND_MAX` is 0x7FFF while the shimmed
+  generators emit glibc's 31-bit range; the shim raises `RAND_MAX` to match,
+  so `rand()/RAND_MAX` idioms behave like they do on Linux.
+- Known issue: the native CUDA training backend does not learn on Windows
+  yet. Rollouts, env stepping, and weight updates all run, but the train-time
+  policy recompute disagrees with rollout-time logprobs from the first epoch
+  (`clipfrac` starts at 1.0, `old_kl` ~7), so PPO ratios are meaningless and
+  the policy stays at random-level performance. Additionally, the CUDA-graph
+  path (`cudagraphs >= 0`, the default) fails at `cudaGraphLaunch` after the
+  capture epoch. Until fixed, train on Windows with the PyTorch backend:
+  build with `-Float` and run `puffer train <env> --slowly` (verified
+  learning, e.g. starmelee reaches 96% success). For the native backend, use
+  `--cudagraphs -1` to at least run eagerly while debugging.
 
 ## Web builds (emscripten) — TODO
 
