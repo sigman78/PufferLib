@@ -86,6 +86,7 @@ typedef struct {
     float spawn_clearance; // min spawn/beacon distance from the planet center
     float min_goal_frac;   // min spawn-to-beacon distance as a fraction of size
     float input_change_penalty; // reward lost per button state change per step
+    int action_repeat;     // physics ticks per decision (latched buttons)
 
     Ship ships[STARMELEE_MAX_SHIPS];
     unsigned int rng;
@@ -164,6 +165,8 @@ void c_init(StarMelee* env) {
     env->min_goal_frac = sm_clampf(env->min_goal_frac, 0.0f, 0.45f);
     if (env->min_goal_frac == 0.0f) env->min_goal_frac = 0.3f;
     if (env->input_change_penalty < 0.0f) env->input_change_penalty = 0.0f;
+    if (env->action_repeat < 1) env->action_repeat = 1;
+    if (env->action_repeat > 8) env->action_repeat = 8;
 }
 
 // Gravity acceleration vector at (x, y), pointing toward the planet:
@@ -335,18 +338,11 @@ void c_reset(StarMelee* env) {
     compute_observations(env);
 }
 
-void c_step(StarMelee* env) {
-    int n = env->num_ships;
-    for (int i = 0; i < n; i++) {
-        env->rewards[i] = 0.0f;
-        env->terminals[i] = 0.0f;
-    }
-
-    // Controls + physics integration
-    for (int i = 0; i < n; i++) {
+// Reads this decision's button states and charges the jitter penalty.
+// Buttons stay latched on the ship for the whole action_repeat window.
+static void sm_read_inputs(StarMelee* env) {
+    for (int i = 0; i < env->num_ships; i++) {
         Ship* s = &env->ships[i];
-        s->episode_tick += 1;
-
         int left = env->actions[i*3 + 0] > 0.5f;
         int right = env->actions[i*3 + 1] > 0.5f;
         int engine = env->actions[i*3 + 2] > 0.5f;
@@ -365,6 +361,19 @@ void c_step(StarMelee* env) {
         s->turning_left = (unsigned char)left;
         s->turning_right = (unsigned char)right;
         s->thrusting = (unsigned char)engine;
+    }
+}
+
+// One 60 Hz physics tick using the latched button states
+static void sm_physics_tick(StarMelee* env) {
+    int n = env->num_ships;
+    for (int i = 0; i < n; i++) {
+        Ship* s = &env->ships[i];
+        s->episode_tick += 1;
+
+        int left = s->turning_left;
+        int right = s->turning_right;
+        int engine = s->thrusting;
 
         // Torque / inertia -> angular acceleration while held
         if (left) s->omega -= env->turn_accel;
@@ -499,7 +508,17 @@ void c_step(StarMelee* env) {
             sm_finish_ship(env, i, -0.25f, SM_RESULT_TIMEOUT);
         }
     }
+}
 
+void c_step(StarMelee* env) {
+    for (int i = 0; i < env->num_ships; i++) {
+        env->rewards[i] = 0.0f;
+        env->terminals[i] = 0.0f;
+    }
+    sm_read_inputs(env);
+    for (int rep = 0; rep < env->action_repeat; rep++) {
+        sm_physics_tick(env);
+    }
     compute_observations(env);
 }
 
@@ -618,7 +637,9 @@ void c_render(StarMelee* env) {
     if (!IsWindowReady()) {
         SetConfigFlags(FLAG_MSAA_4X_HINT);
         InitWindow(760, 760, "PufferLib StarMelee");
-        SetTargetFPS(60);
+        // One render per c_step; scale FPS so action_repeat > 1 (training
+        // cadence) still plays back at real-time physics speed.
+        SetTargetFPS(60 / (env->action_repeat > 0 ? env->action_repeat : 1));
     }
     if (IsKeyDown(KEY_ESCAPE)) {
         exit(0);

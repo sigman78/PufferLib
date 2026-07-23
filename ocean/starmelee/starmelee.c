@@ -67,6 +67,7 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "spawn_clearance") == 0) env->spawn_clearance = value;
         else if (strcmp(key, "min_goal_frac") == 0) env->min_goal_frac = value;
         else if (strcmp(key, "input_change_penalty") == 0) env->input_change_penalty = value;
+        else if (strcmp(key, "action_repeat") == 0) env->action_repeat = (int)value;
     }
     fclose(f);
     return 1;
@@ -82,6 +83,9 @@ int main(int argc, char** argv) {
     } else {
         printf("No ini at %s: using built-in defaults\n", ini_path);
     }
+    // Manual play reads the keyboard every frame; latching inputs across
+    // repeated ticks (training cadence) would fast-forward the game 4x.
+    env.action_repeat = 1;
     c_init(&env);
 
     int num_agents = env.num_agents;

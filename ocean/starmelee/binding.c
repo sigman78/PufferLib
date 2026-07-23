@@ -70,6 +70,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->spawn_clearance = (float)dict_get(kwargs, "spawn_clearance")->value;
     env->min_goal_frac = (float)dict_get(kwargs, "min_goal_frac")->value;
     env->input_change_penalty = (float)dict_get(kwargs, "input_change_penalty")->value;
+    env->action_repeat = (int)dict_get(kwargs, "action_repeat")->value;
     c_init(env);
 }
 
