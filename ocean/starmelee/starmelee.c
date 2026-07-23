@@ -93,6 +93,7 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "asteroid_speed_min") == 0) env->asteroid_speed_min = value;
         else if (strcmp(key, "asteroid_speed_max") == 0) env->asteroid_speed_max = value;
         else if (strcmp(key, "asteroid_respawn_ticks") == 0) env->asteroid_respawn_ticks = (int)value;
+        else if (strcmp(key, "danger_hp_weight") == 0) env->danger_hp_weight = value;
     }
     fclose(f);
     return 1;

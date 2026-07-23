@@ -10,7 +10,8 @@
 #include <string.h>
 #include "raylib.h"
 
-#define STARMELEE_OBS_SIZE 39
+#define STARMELEE_OBS_SIZE 44
+#define STARMELEE_OBS_ASTEROIDS 2  // rocks with their own stable obs slots
 #define STARMELEE_MAX_SHIPS 8
 #define STARMELEE_MAX_ASTEROIDS 8
 #define STARMELEE_TRAIL_LEN 48
@@ -164,6 +165,7 @@ typedef struct {
     float asteroid_speed_min;
     float asteroid_speed_max;    // clamped to max_speed / 2
     int asteroid_respawn_ticks;  // delay before a destroyed rock returns
+    float danger_hp_weight;      // hazard pain grows this much as hp empties
 
     Ship ships[STARMELEE_MAX_SHIPS];
     Asteroid asteroids[STARMELEE_MAX_ASTEROIDS];
@@ -298,6 +300,16 @@ void c_init(StarMelee* env) {
         env->asteroid_speed_min = 0.3f * env->asteroid_speed_max;
     }
     if (env->asteroid_respawn_ticks < 1) env->asteroid_respawn_ticks = 300;
+    env->danger_hp_weight = sm_clampf(env->danger_hp_weight, 0.0f, 3.0f);
+}
+
+// Hazard pain multiplier: the same hp loss should hurt more when hp is low,
+// mirroring the convex value of health (death and retreat are nearby).
+// Flat pain was measurably ignored: a blindfold test showed the trained
+// policy paid zero attention to asteroid observations.
+static inline float sm_pain_scale(StarMelee* env, Ship* s) {
+    float hp_frac = sm_clampf(s->hp / env->hp_max, 0.0f, 1.0f);
+    return 1.0f + env->danger_hp_weight * (1.0f - hp_frac);
 }
 
 static inline float sm_trait(StarMelee* env) {
@@ -543,7 +555,8 @@ static void sm_asteroids_tick(StarMelee* env) {
             s->asteroid_hits += 1;
             s->vx += 0.3f * a->vx;
             s->vy += 0.3f * a->vy;
-            float pain = -fminf(damage, 0.6f * env->hp_max) / env->hp_max;
+            float pain = -fminf(damage, 0.6f * env->hp_max) / env->hp_max
+                * sm_pain_scale(env, s);
             env->rewards[i] += pain;
             s->episode_return += pain;
             sm_destroy_asteroid(env, k);
@@ -634,30 +647,25 @@ void compute_observations(StarMelee* env) {
         obs[31] = s->t_caution - 1.0f;
         obs[33] = s->attack_state == SM_STATE_RETREAT ? 1.0f : 0.0f;
 
-        // Nearest active asteroid; rocks are dumb but they hurt
-        int rock = -1;
-        float rock_dist = 0.0f;
-        for (int k = 0; k < env->num_asteroids; k++) {
-            if (!env->asteroids[k].active) continue;
-            float d = sm_torus_dist(env, s->x, s->y, env->asteroids[k].x, env->asteroids[k].y);
-            if (rock < 0 || d < rock_dist) {
-                rock = k;
-                rock_dist = d;
+        // Rocks in fixed slots keyed by asteroid index: a nearest-rock obs
+        // flickers identity when two rocks trade places, which shreds the
+        // apparent-velocity signal the policy needs to dodge
+        for (int slot = 0; slot < STARMELEE_OBS_ASTEROIDS; slot++) {
+            int base = 34 + 5 * slot;
+            Asteroid* a = slot < env->num_asteroids ? &env->asteroids[slot] : NULL;
+            if (a != NULL && a->active) {
+                obs[base + 0] = sm_wrap_delta(a->x - s->x, env->size) / half;
+                obs[base + 1] = sm_wrap_delta(a->y - s->y, env->size) / half;
+                obs[base + 2] = (a->vx - s->vx) / (2.0f * env->max_speed);
+                obs[base + 3] = (a->vy - s->vy) / (2.0f * env->max_speed);
+                obs[base + 4] = 1.0f;
+            } else {
+                obs[base + 0] = 0.0f;
+                obs[base + 1] = 0.0f;
+                obs[base + 2] = 0.0f;
+                obs[base + 3] = 0.0f;
+                obs[base + 4] = 0.0f;
             }
-        }
-        if (rock >= 0) {
-            Asteroid* a = &env->asteroids[rock];
-            obs[34] = sm_wrap_delta(a->x - s->x, env->size) / half;
-            obs[35] = sm_wrap_delta(a->y - s->y, env->size) / half;
-            obs[36] = (a->vx - s->vx) / (2.0f * env->max_speed);
-            obs[37] = (a->vy - s->vy) / (2.0f * env->max_speed);
-            obs[38] = 1.0f;
-        } else {
-            obs[34] = 0.0f;
-            obs[35] = 0.0f;
-            obs[36] = 0.0f;
-            obs[37] = 0.0f;
-            obs[38] = 0.0f;
         }
     }
 }
@@ -960,7 +968,8 @@ static void sm_physics_tick(StarMelee* env) {
             s->planet_hits += 1;
             // Pain cap: a terminal step already adds -1, and the trainer
             // clamps steps to [-1, 1]; uncapped pain just gets truncated
-            float pain = -fminf(damage, 0.6f * env->hp_max) / env->hp_max;
+            float pain = -fminf(damage, 0.6f * env->hp_max) / env->hp_max
+                * sm_pain_scale(env, s);
             env->rewards[i] += pain;
             s->episode_return += pain;
         }

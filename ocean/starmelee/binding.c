@@ -102,6 +102,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->asteroid_speed_min = (float)dict_get(kwargs, "asteroid_speed_min")->value;
     env->asteroid_speed_max = (float)dict_get(kwargs, "asteroid_speed_max")->value;
     env->asteroid_respawn_ticks = (int)dict_get(kwargs, "asteroid_respawn_ticks")->value;
+    env->danger_hp_weight = (float)dict_get(kwargs, "danger_hp_weight")->value;
     c_init(env);
 }
 
