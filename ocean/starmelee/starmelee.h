@@ -10,12 +10,14 @@
 #include <string.h>
 #include "raylib.h"
 
-#define STARMELEE_OBS_SIZE 26
+#define STARMELEE_OBS_SIZE 34
 #define STARMELEE_MAX_SHIPS 8
 #define STARMELEE_TRAIL_LEN 48
 
 const unsigned char SM_STATE_APPROACH = 0;
 const unsigned char SM_STATE_FLEE = 1;
+const unsigned char SM_STATE_REGROUP = 2;
+const unsigned char SM_STATE_RETREAT = 3;  // low hp: survival first
 
 const unsigned char SM_RESULT_SUCCESS = 0;
 const unsigned char SM_RESULT_CRASH = 1;
@@ -35,6 +37,7 @@ typedef struct {
     float input_changes;  // button toggles per step (jitter measure)
     float attack_passes;  // combat: completed aim-and-fire passes
     float full_cycles;    // combat: fire followed by clean disengage
+    float retreats;       // combat: times low hp forced a retreat
     float n;
 } Log;
 
@@ -59,12 +62,21 @@ typedef struct {
     unsigned char last_result;
     int event_timer;  // render-only feedback countdown
     // combat mode
-    unsigned char attack_state;  // SM_STATE_APPROACH / SM_STATE_FLEE
+    unsigned char attack_state;  // APPROACH / FLEE / REGROUP / RETREAT
     int aim_progress;            // consecutive-ish on-target ticks
+    int reengage_timer;          // REGROUP cooldown remaining, ticks
     int attack_passes;
     int full_cycles;
+    int retreats;
     float prev_enemy_dist;       // < 0 until first combat tick
     int fire_flash;              // render-only muzzle flash countdown
+    // Per-spawn trait multipliers (1.0 +- trait_variation), observable by
+    // the ship itself so the shared policy can act on its own build
+    float t_thrust;
+    float t_turn;
+    float t_speed;
+    float t_fragility;  // damage (and its reward pain) taken multiplier
+    float t_caution;    // how much being fired at hurts this ship's reward
 } Ship;
 
 typedef struct {
@@ -114,6 +126,11 @@ typedef struct {
     float cycle_reward;      // completing the disengage
     float targeted_penalty;  // charged to the ship that got fired at
     float duel_spawn_frac;   // spawn separation as a fraction of size
+    float trait_variation;   // +- range of per-spawn trait multipliers, 0..0.5
+    int reengage_ticks;      // REGROUP cooldown after a disengage
+    float loiter_reward;     // per tick spent beyond disengage_range in REGROUP
+    float retreat_hp_frac;   // hp fraction that forces RETREAT; 0 disables
+    float hp_regen;          // hp per tick while beyond disengage_range
 
     Ship ships[STARMELEE_MAX_SHIPS];
     unsigned int rng;
@@ -215,6 +232,15 @@ void c_init(StarMelee* env) {
     env->duel_spawn_frac = sm_clampf(env->duel_spawn_frac, 0.0f, 0.45f);
     if (env->duel_spawn_frac == 0.0f) env->duel_spawn_frac = 0.35f;
     if (env->combat && env->num_ships < 2) env->combat = 0;
+    env->trait_variation = sm_clampf(env->trait_variation, 0.0f, 0.5f);
+    if (env->reengage_ticks <= 0) env->reengage_ticks = 180;
+    if (env->loiter_reward < 0.0f) env->loiter_reward = 0.0f;
+    env->retreat_hp_frac = sm_clampf(env->retreat_hp_frac, 0.0f, 0.9f);
+    if (env->hp_regen < 0.0f) env->hp_regen = 0.0f;
+}
+
+static inline float sm_trait(StarMelee* env) {
+    return 1.0f + env->trait_variation * (2.0f * sm_randf(env) - 1.0f);
 }
 
 // Gravity acceleration vector at (x, y), pointing toward the planet:
@@ -343,6 +369,13 @@ static void sm_spawn_ship(StarMelee* env, int i) {
     s->full_cycles = 0;
     s->prev_enemy_dist = -1.0f;
     s->fire_flash = 0;
+    s->reengage_timer = 0;
+    s->retreats = 0;
+    s->t_thrust = sm_trait(env);
+    s->t_turn = sm_trait(env);
+    s->t_speed = sm_trait(env);
+    s->t_fragility = sm_trait(env);
+    s->t_caution = sm_trait(env);
 
     if (env->combat) {
         // No beacon in a duel; the other ship is the target
@@ -418,17 +451,30 @@ void compute_observations(StarMelee* env) {
                 obs[18] = cosf(aim_delta);
                 obs[19] = sinf(aim_delta);
                 obs[20] = sm_los_clear(env, s->x, s->y, o->x, o->y) ? 1.0f : 0.0f;
-                obs[21] = s->attack_state == SM_STATE_FLEE ? 1.0f : 0.0f;
+                obs[21] = s->attack_state == SM_STATE_FLEE ? 1.0f
+                    : (s->attack_state == SM_STATE_REGROUP ? 0.5f : 0.0f);
                 obs[22] = (float)s->aim_progress / (float)env->aim_ticks;
                 obs[23] = (float)o->aim_progress / (float)env->aim_ticks;
                 obs[24] = cosf(o->heading);
                 obs[25] = sinf(o->heading);
+                obs[26] = (float)s->reengage_timer / (float)env->reengage_ticks;
+                obs[32] = o->hp / env->hp_max;  // smell blood: press a wounded enemy
             } else {
-                for (int k = 18; k < STARMELEE_OBS_SIZE; k++) obs[k] = 0.0f;
+                for (int k = 18; k < 27; k++) obs[k] = 0.0f;
+                obs[32] = 0.0f;
             }
         } else {
-            for (int k = 13; k < STARMELEE_OBS_SIZE; k++) obs[k] = 0.0f;
+            for (int k = 13; k < 27; k++) obs[k] = 0.0f;
+            obs[32] = 0.0f;
         }
+
+        // Own build: the policy needs to know what ship it is flying
+        obs[27] = s->t_thrust - 1.0f;
+        obs[28] = s->t_turn - 1.0f;
+        obs[29] = s->t_speed - 1.0f;
+        obs[30] = s->t_fragility - 1.0f;
+        obs[31] = s->t_caution - 1.0f;
+        obs[33] = s->attack_state == SM_STATE_RETREAT ? 1.0f : 0.0f;
     }
 }
 
@@ -453,6 +499,7 @@ static void sm_add_log(StarMelee* env, Ship* s, unsigned char result) {
     env->log.planet_hits += s->planet_hits;
     env->log.attack_passes += (float)s->attack_passes;
     env->log.full_cycles += (float)s->full_cycles;
+    env->log.retreats += (float)s->retreats;
     env->log.input_changes += s->episode_tick > 0
         ? (float)s->input_changes / (float)s->episode_tick : 0.0f;
     env->log.n += 1.0f;
@@ -498,6 +545,16 @@ static void sm_combat_tick(StarMelee* env, int i) {
     float dist = sqrtf(dx*dx + dy*dy);
     float r = 0.0f;
 
+    // Low hp overrides everything: break off and survive. Hysteresis (exit
+    // well above the entry threshold) stops flapping at the boundary.
+    float retreat_enter = env->retreat_hp_frac * env->hp_max;
+    if (retreat_enter > 0.0f && s->attack_state != SM_STATE_RETREAT
+            && s->hp <= retreat_enter) {
+        s->attack_state = SM_STATE_RETREAT;
+        s->aim_progress = 0;
+        s->retreats += 1;
+    }
+
     if (s->attack_state == SM_STATE_APPROACH) {
         // Shaping toward the firing band [attack_range_min, attack_range_max]
         float band_now = fmaxf(0.0f, dist - env->attack_range_max)
@@ -529,14 +586,16 @@ static void sm_combat_tick(StarMelee* env, int i) {
                 s->aim_progress = 0;
                 s->attack_state = SM_STATE_FLEE;
                 s->fire_flash = 14;
-                // Getting shot at teaches evasion and planet-shielding
-                env->rewards[j] -= env->targeted_penalty;
-                e->episode_return -= env->targeted_penalty;
+                // Getting shot at teaches evasion and planet-shielding;
+                // cautious builds feel it more and should expose themselves less
+                float sting = env->targeted_penalty * e->t_caution;
+                env->rewards[j] -= sting;
+                e->episode_return -= sting;
             }
         } else if (s->aim_progress > 0) {
             s->aim_progress -= 1;
         }
-    } else {
+    } else if (s->attack_state == SM_STATE_FLEE) {
         // FLEE: you are the target now, open distance fast
         if (s->prev_enemy_dist >= 0.0f) {
             r += env->engage_scale * (dist - s->prev_enemy_dist) / env->size;
@@ -544,8 +603,35 @@ static void sm_combat_tick(StarMelee* env, int i) {
         if (dist >= env->disengage_range) {
             r += env->cycle_reward;
             s->full_cycles += 1;
+            s->attack_state = SM_STATE_REGROUP;
+            s->reengage_timer = env->reengage_ticks;
+        }
+    } else if (s->attack_state == SM_STATE_REGROUP) {
+        // REGROUP: weapons cooling down; loiter out wide before re-engaging
+        s->reengage_timer -= 1;
+        if (dist >= env->disengage_range) {
+            r += env->loiter_reward;
+        }
+        if (s->reengage_timer <= 0) {
             s->attack_state = SM_STATE_APPROACH;
         }
+    } else {
+        // RETREAT: wounded, escape shaping only until hp recovers
+        if (s->prev_enemy_dist >= 0.0f) {
+            r += env->engage_scale * (dist - s->prev_enemy_dist) / env->size;
+        }
+        if (dist >= env->disengage_range) {
+            r += env->loiter_reward;
+        }
+        float retreat_exit = fminf(env->retreat_hp_frac + 0.15f, 1.0f) * env->hp_max;
+        if (s->hp >= retreat_exit) {
+            s->attack_state = SM_STATE_APPROACH;
+        }
+    }
+
+    // Shields recharge only at a safe distance: backing off buys hp back
+    if (env->hp_regen > 0.0f && dist >= env->disengage_range && s->hp < env->hp_max) {
+        s->hp = fminf(env->hp_max, s->hp + env->hp_regen);
     }
 
     s->prev_enemy_dist = dist;
@@ -591,10 +677,12 @@ static void sm_physics_tick(StarMelee* env) {
         int engine = s->thrusting;
 
         // Torque / inertia -> angular acceleration while held
-        if (left) s->omega -= env->turn_accel;
-        if (right) s->omega += env->turn_accel;
+        float turn_accel = env->turn_accel * s->t_turn;
+        float max_turn = env->max_turn_rate * s->t_turn;
+        if (left) s->omega -= turn_accel;
+        if (right) s->omega += turn_accel;
         s->omega *= env->angular_damping;
-        s->omega = sm_clampf(s->omega, -env->max_turn_rate, env->max_turn_rate);
+        s->omega = sm_clampf(s->omega, -max_turn, max_turn);
         s->heading = fmodf(s->heading + s->omega, 2.0f * PI);
         if (s->heading < 0.0f) s->heading += 2.0f * PI;
 
@@ -608,9 +696,10 @@ static void sm_physics_tick(StarMelee* env) {
         // off any excess the slingshot gave us
         if (engine) {
             float prev_speed = sqrtf(s->vx*s->vx + s->vy*s->vy);
-            float cap = fmaxf(env->max_speed, prev_speed);
-            s->vx += env->thrust * cosf(s->heading);
-            s->vy += env->thrust * sinf(s->heading);
+            float cap = fmaxf(env->max_speed * s->t_speed, prev_speed);
+            float thrust = env->thrust * s->t_thrust;
+            s->vx += thrust * cosf(s->heading);
+            s->vy += thrust * sinf(s->heading);
             float speed = sqrtf(s->vx*s->vx + s->vy*s->vy);
             if (speed > cap) {
                 s->vx *= cap / speed;
@@ -656,7 +745,7 @@ static void sm_physics_tick(StarMelee* env) {
         if (vn < 0.0f) {
             s->vx -= (1.0f + env->restitution) * vn * nx;
             s->vy -= (1.0f + env->restitution) * vn * ny;
-            float damage = env->damage_scale * -vn;
+            float damage = env->damage_scale * -vn * s->t_fragility;
             s->hp -= damage;
             s->planet_hits += 1;
             float pain = -damage / env->hp_max;
@@ -828,7 +917,13 @@ static void sm_draw_ship_sprite(StarMelee* env, float sx, float sy, float scale,
     Vector2 nose = {c.x + dir.x * len, c.y + dir.y * len};
     Vector2 lwing = {c.x - dir.x * len * 0.55f + side.x * wid, c.y - dir.y * len * 0.55f + side.y * wid};
     Vector2 rwing = {c.x - dir.x * len * 0.55f - side.x * wid, c.y - dir.y * len * 0.55f - side.y * wid};
-    Color color = SM_SHIP_COLORS[i];
+    // Wounded ships visibly fade (and flicker hard while retreating)
+    float hp_frac = sm_clampf(s->hp / env->hp_max, 0.0f, 1.0f);
+    float glow = 0.45f + 0.55f * hp_frac;
+    if (s->attack_state == SM_STATE_RETREAT && ((int)(GetTime() * 10.0f) % 2)) {
+        glow *= 0.55f;
+    }
+    Color color = Fade(SM_SHIP_COLORS[i], glow);
 
     if (s->thrusting) {
         Vector2 base = {c.x - dir.x * len * 0.62f, c.y - dir.y * len * 0.62f};
@@ -976,10 +1071,20 @@ void c_render(StarMelee* env) {
     DrawRectangle(12, 10, 190, env->combat ? 122 : 104, Fade(BLACK, 0.35f));
     if (env->combat) {
         DrawText("Duel: aim, fire, disengage", 20, 16, 16, SM_WHITE);
+        const char* state_name = "ATTACK";
+        Color state_color = SM_GREEN;
+        if (s0->attack_state == SM_STATE_FLEE) {
+            state_name = "FLEE";
+            state_color = SM_YELLOW;
+        } else if (s0->attack_state == SM_STATE_REGROUP) {
+            state_name = "REGROUP";
+            state_color = SM_CYAN;
+        } else if (s0->attack_state == SM_STATE_RETREAT) {
+            state_name = "RETREAT";
+            state_color = SM_RED;
+        }
         DrawText(TextFormat("%s  passes %d  cycles %d",
-            s0->attack_state == SM_STATE_FLEE ? "FLEE" : "ATTACK",
-            s0->attack_passes, s0->full_cycles), 20, 112, 12,
-            s0->attack_state == SM_STATE_FLEE ? SM_YELLOW : SM_GREEN);
+            state_name, s0->attack_passes, s0->full_cycles), 20, 112, 12, state_color);
     } else {
         DrawText("Fly to your beacon", 20, 16, 16, SM_WHITE);
     }

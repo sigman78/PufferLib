@@ -84,6 +84,11 @@ void my_init(Env* env, Dict* kwargs) {
     env->cycle_reward = (float)dict_get(kwargs, "cycle_reward")->value;
     env->targeted_penalty = (float)dict_get(kwargs, "targeted_penalty")->value;
     env->duel_spawn_frac = (float)dict_get(kwargs, "duel_spawn_frac")->value;
+    env->trait_variation = (float)dict_get(kwargs, "trait_variation")->value;
+    env->reengage_ticks = (int)dict_get(kwargs, "reengage_ticks")->value;
+    env->loiter_reward = (float)dict_get(kwargs, "loiter_reward")->value;
+    env->retreat_hp_frac = (float)dict_get(kwargs, "retreat_hp_frac")->value;
+    env->hp_regen = (float)dict_get(kwargs, "hp_regen")->value;
     c_init(env);
 }
 
@@ -100,4 +105,5 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "input_changes", log->input_changes);
     dict_set(out, "attack_passes", log->attack_passes);
     dict_set(out, "full_cycles", log->full_cycles);
+    dict_set(out, "retreats", log->retreats);
 }
