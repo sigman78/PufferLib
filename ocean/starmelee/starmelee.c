@@ -68,6 +68,19 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "min_goal_frac") == 0) env->min_goal_frac = value;
         else if (strcmp(key, "input_change_penalty") == 0) env->input_change_penalty = value;
         else if (strcmp(key, "action_repeat") == 0) env->action_repeat = (int)value;
+        else if (strcmp(key, "combat") == 0) env->combat = (int)value;
+        else if (strcmp(key, "attack_range_min") == 0) env->attack_range_min = value;
+        else if (strcmp(key, "attack_range_max") == 0) env->attack_range_max = value;
+        else if (strcmp(key, "aim_cone") == 0) env->aim_cone = value;
+        else if (strcmp(key, "aim_ticks") == 0) env->aim_ticks = (int)value;
+        else if (strcmp(key, "disengage_range") == 0) env->disengage_range = value;
+        else if (strcmp(key, "engage_scale") == 0) env->engage_scale = value;
+        else if (strcmp(key, "aim_reward") == 0) env->aim_reward = value;
+        else if (strcmp(key, "strafe_reward") == 0) env->strafe_reward = value;
+        else if (strcmp(key, "fire_reward") == 0) env->fire_reward = value;
+        else if (strcmp(key, "cycle_reward") == 0) env->cycle_reward = value;
+        else if (strcmp(key, "targeted_penalty") == 0) env->targeted_penalty = value;
+        else if (strcmp(key, "duel_spawn_frac") == 0) env->duel_spawn_frac = value;
     }
     fclose(f);
     return 1;

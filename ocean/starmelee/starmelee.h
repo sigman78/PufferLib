@@ -10,9 +10,12 @@
 #include <string.h>
 #include "raylib.h"
 
-#define STARMELEE_OBS_SIZE 18
+#define STARMELEE_OBS_SIZE 26
 #define STARMELEE_MAX_SHIPS 8
 #define STARMELEE_TRAIL_LEN 48
+
+const unsigned char SM_STATE_APPROACH = 0;
+const unsigned char SM_STATE_FLEE = 1;
 
 const unsigned char SM_RESULT_SUCCESS = 0;
 const unsigned char SM_RESULT_CRASH = 1;
@@ -30,6 +33,8 @@ typedef struct {
     float final_distance;
     float planet_hits;
     float input_changes;  // button toggles per step (jitter measure)
+    float attack_passes;  // combat: completed aim-and-fire passes
+    float full_cycles;    // combat: fire followed by clean disengage
     float n;
 } Log;
 
@@ -53,6 +58,13 @@ typedef struct {
     unsigned char turning_right;
     unsigned char last_result;
     int event_timer;  // render-only feedback countdown
+    // combat mode
+    unsigned char attack_state;  // SM_STATE_APPROACH / SM_STATE_FLEE
+    int aim_progress;            // consecutive-ish on-target ticks
+    int attack_passes;
+    int full_cycles;
+    float prev_enemy_dist;       // < 0 until first combat tick
+    int fire_flash;              // render-only muzzle flash countdown
 } Ship;
 
 typedef struct {
@@ -87,6 +99,21 @@ typedef struct {
     float min_goal_frac;   // min spawn-to-beacon distance as a fraction of size
     float input_change_penalty; // reward lost per button state change per step
     int action_repeat;     // physics ticks per decision (latched buttons)
+
+    // combat (duel) mode
+    int combat;            // 0 = navigate to beacon, 1 = duel the other ship
+    float attack_range_min;  // firing band, world units
+    float attack_range_max;
+    float aim_cone;          // max bearing error while aiming, rad
+    int aim_ticks;           // on-target ticks needed to complete a pass
+    float disengage_range;   // flee distance that completes a cycle
+    float engage_scale;      // shaping scale for band-approach / flee distance
+    float aim_reward;        // per on-target tick
+    float strafe_reward;     // per tick, scaled by transverse speed while aiming
+    float fire_reward;       // completing an aim pass
+    float cycle_reward;      // completing the disengage
+    float targeted_penalty;  // charged to the ship that got fired at
+    float duel_spawn_frac;   // spawn separation as a fraction of size
 
     Ship ships[STARMELEE_MAX_SHIPS];
     unsigned int rng;
@@ -167,6 +194,27 @@ void c_init(StarMelee* env) {
     if (env->input_change_penalty < 0.0f) env->input_change_penalty = 0.0f;
     if (env->action_repeat < 1) env->action_repeat = 1;
     if (env->action_repeat > 8) env->action_repeat = 8;
+
+    if (env->attack_range_min <= 0.0f) env->attack_range_min = 4.0f * env->ship_radius;
+    if (env->attack_range_max <= env->attack_range_min) {
+        env->attack_range_max = 2.5f * env->attack_range_min;
+    }
+    env->aim_cone = sm_clampf(env->aim_cone, 0.0f, 1.0f);
+    if (env->aim_cone == 0.0f) env->aim_cone = 0.15f;
+    if (env->aim_ticks < 1) env->aim_ticks = 30;
+    if (env->disengage_range <= env->attack_range_max) {
+        env->disengage_range = 2.0f * env->attack_range_max;
+    }
+    env->disengage_range = fminf(env->disengage_range, 0.45f * env->size);
+    if (env->engage_scale == 0.0f) env->engage_scale = 2.0f;
+    if (env->aim_reward < 0.0f) env->aim_reward = 0.0f;
+    if (env->strafe_reward < 0.0f) env->strafe_reward = 0.0f;
+    if (env->fire_reward == 0.0f) env->fire_reward = 1.0f;
+    if (env->cycle_reward == 0.0f) env->cycle_reward = 0.5f;
+    if (env->targeted_penalty < 0.0f) env->targeted_penalty = 0.0f;
+    env->duel_spawn_frac = sm_clampf(env->duel_spawn_frac, 0.0f, 0.45f);
+    if (env->duel_spawn_frac == 0.0f) env->duel_spawn_frac = 0.35f;
+    if (env->combat && env->num_ships < 2) env->combat = 0;
 }
 
 // Gravity acceleration vector at (x, y), pointing toward the planet:
@@ -194,6 +242,38 @@ static inline void sm_gravity_at(StarMelee* env, float x, float y, float* gx, fl
     *gy = a * dy / r;
 }
 
+// True when the planet does not block the straight (minimal-image) segment
+// between two points: aiming needs it, and it makes the planet usable as a
+// shield. Segments are short (attack range) relative to the torus, so the
+// planet image nearest to the first endpoint is the only one that matters.
+static int sm_los_clear(StarMelee* env, float ax, float ay, float bx, float by) {
+    float dx = sm_wrap_delta(bx - ax, env->size);
+    float dy = sm_wrap_delta(by - ay, env->size);
+    float px = sm_wrap_delta(sm_planet_x(env) - ax, env->size);
+    float py = sm_wrap_delta(sm_planet_y(env) - ay, env->size);
+    float len2 = dx*dx + dy*dy;
+    float t = len2 > 1e-6f ? (px*dx + py*dy) / len2 : 0.0f;
+    t = sm_clampf(t, 0.0f, 1.0f);
+    float cx = t*dx - px;
+    float cy = t*dy - py;
+    return cx*cx + cy*cy >= env->planet_radius * env->planet_radius;
+}
+
+static int sm_nearest_enemy(StarMelee* env, int i) {
+    Ship* s = &env->ships[i];
+    int nearest = -1;
+    float nearest_dist = 0.0f;
+    for (int j = 0; j < env->num_ships; j++) {
+        if (j == i) continue;
+        float d = sm_torus_dist(env, s->x, s->y, env->ships[j].x, env->ships[j].y);
+        if (nearest < 0 || d < nearest_dist) {
+            nearest = j;
+            nearest_dist = d;
+        }
+    }
+    return nearest;
+}
+
 // Random point on the torus at least min_planet_dist from the planet center.
 // Falls back to a point exactly min_planet_dist away in a random direction,
 // which always exists since c_init clamps clearance to 0.45*size.
@@ -216,10 +296,38 @@ static void sm_spawn_ship(StarMelee* env, int i) {
     Ship* s = &env->ships[i];
     float clearance = env->spawn_clearance;
 
-    sm_sample_clear_point(env, clearance, &s->x, &s->y);
+    // Duel: spawn opposite an existing ship at duel_spawn_frac * size,
+    // roughly facing it, so episodes open with two ships closing in.
+    int anchor = -1;
+    if (env->combat) {
+        for (int j = 0; j < env->num_ships; j++) {
+            if (j != i && env->ships[j].hp > 0.0f) {
+                anchor = j;
+                break;
+            }
+        }
+    }
+    if (anchor >= 0) {
+        Ship* a = &env->ships[anchor];
+        float sep = env->duel_spawn_frac * env->size;
+        for (int attempt = 0; attempt < 100; attempt++) {
+            float ang = 2.0f * PI * sm_randf(env);
+            s->x = sm_wrap_pos(a->x + sep * cosf(ang), env->size);
+            s->y = sm_wrap_pos(a->y + sep * sinf(ang), env->size);
+            if (sm_torus_dist(env, s->x, s->y, sm_planet_x(env), sm_planet_y(env)) >= clearance) {
+                break;
+            }
+        }
+        float hdx = sm_wrap_delta(a->x - s->x, env->size);
+        float hdy = sm_wrap_delta(a->y - s->y, env->size);
+        s->heading = atan2f(hdy, hdx) + 0.6f * (sm_randf(env) - 0.5f);
+        if (s->heading < 0.0f) s->heading += 2.0f * PI;
+    } else {
+        sm_sample_clear_point(env, clearance, &s->x, &s->y);
+        s->heading = 2.0f * PI * sm_randf(env);
+    }
     s->vx = 0.0f;
     s->vy = 0.0f;
-    s->heading = 2.0f * PI * sm_randf(env);
     s->omega = 0.0f;
     s->hp = env->hp_max;
     s->episode_tick = 0;
@@ -229,6 +337,20 @@ static void sm_spawn_ship(StarMelee* env, int i) {
     s->thrusting = 0;
     s->turning_left = 0;
     s->turning_right = 0;
+    s->attack_state = SM_STATE_APPROACH;
+    s->aim_progress = 0;
+    s->attack_passes = 0;
+    s->full_cycles = 0;
+    s->prev_enemy_dist = -1.0f;
+    s->fire_flash = 0;
+
+    if (env->combat) {
+        // No beacon in a duel; the other ship is the target
+        s->goal_x = s->x;
+        s->goal_y = s->y;
+        s->prev_goal_dist = 0.0f;
+        return;
+    }
 
     // Beacon: clear of the planet and not trivially close to the spawn
     float min_goal_dist = env->min_goal_frac * env->size;
@@ -282,33 +404,55 @@ void compute_observations(StarMelee* env) {
         }
         if (nearest >= 0) {
             Ship* o = &env->ships[nearest];
-            obs[13] = sm_wrap_delta(o->x - s->x, env->size) / half;
-            obs[14] = sm_wrap_delta(o->y - s->y, env->size) / half;
+            float odx = sm_wrap_delta(o->x - s->x, env->size);
+            float ody = sm_wrap_delta(o->y - s->y, env->size);
+            obs[13] = odx / half;
+            obs[14] = ody / half;
             // Both ships can move at up to 2*max_speed (hard cap)
             obs[15] = (o->vx - s->vx) / (2.0f * env->max_speed);
             obs[16] = (o->vy - s->vy) / (2.0f * env->max_speed);
             obs[17] = 1.0f;
+            if (env->combat) {
+                float bearing = atan2f(ody, odx);
+                float aim_delta = s->heading - bearing;
+                obs[18] = cosf(aim_delta);
+                obs[19] = sinf(aim_delta);
+                obs[20] = sm_los_clear(env, s->x, s->y, o->x, o->y) ? 1.0f : 0.0f;
+                obs[21] = s->attack_state == SM_STATE_FLEE ? 1.0f : 0.0f;
+                obs[22] = (float)s->aim_progress / (float)env->aim_ticks;
+                obs[23] = (float)o->aim_progress / (float)env->aim_ticks;
+                obs[24] = cosf(o->heading);
+                obs[25] = sinf(o->heading);
+            } else {
+                for (int k = 18; k < STARMELEE_OBS_SIZE; k++) obs[k] = 0.0f;
+            }
         } else {
-            obs[13] = 0.0f;
-            obs[14] = 0.0f;
-            obs[15] = 0.0f;
-            obs[16] = 0.0f;
-            obs[17] = 0.0f;
+            for (int k = 13; k < STARMELEE_OBS_SIZE; k++) obs[k] = 0.0f;
         }
     }
 }
 
 static void sm_add_log(StarMelee* env, Ship* s, unsigned char result) {
-    env->log.perf += result == SM_RESULT_SUCCESS ? 1.0f : 0.0f;
-    env->log.score += result == SM_RESULT_SUCCESS ? 1.0f
-        : (result == SM_RESULT_CRASH ? -1.0f : 0.0f);
+    if (env->combat) {
+        // A duel episode is scored by completed passes and clean disengages
+        env->log.perf += (float)s->attack_passes;
+        env->log.score += (float)s->attack_passes + 0.5f * (float)s->full_cycles
+            - (result == SM_RESULT_CRASH ? 1.0f : 0.0f);
+        env->log.success_rate += s->full_cycles > 0 ? 1.0f : 0.0f;
+    } else {
+        env->log.perf += result == SM_RESULT_SUCCESS ? 1.0f : 0.0f;
+        env->log.score += result == SM_RESULT_SUCCESS ? 1.0f
+            : (result == SM_RESULT_CRASH ? -1.0f : 0.0f);
+        env->log.success_rate += result == SM_RESULT_SUCCESS ? 1.0f : 0.0f;
+    }
     env->log.episode_return += s->episode_return;
     env->log.episode_length += s->episode_tick;
-    env->log.success_rate += result == SM_RESULT_SUCCESS ? 1.0f : 0.0f;
     env->log.crash_rate += result == SM_RESULT_CRASH ? 1.0f : 0.0f;
     env->log.timeout_rate += result == SM_RESULT_TIMEOUT ? 1.0f : 0.0f;
     env->log.final_distance += s->prev_goal_dist / env->size;
     env->log.planet_hits += s->planet_hits;
+    env->log.attack_passes += (float)s->attack_passes;
+    env->log.full_cycles += (float)s->full_cycles;
     env->log.input_changes += s->episode_tick > 0
         ? (float)s->input_changes / (float)s->episode_tick : 0.0f;
     env->log.n += 1.0f;
@@ -336,6 +480,77 @@ void c_reset(StarMelee* env) {
         env->ships[i].event_timer = 0;
     }
     compute_observations(env);
+}
+
+// One combat tick for ship i: the approach -> aim/fire -> flee cycle.
+// Aiming requires being inside the firing band with clear line of sight and
+// bearing within aim_cone; holding it for aim_ticks completes a pretend shot
+// (rewarding the shooter, penalizing the target), after which the ship must
+// open distance to disengage_range before re-engaging.
+static void sm_combat_tick(StarMelee* env, int i) {
+    Ship* s = &env->ships[i];
+    int j = sm_nearest_enemy(env, i);
+    if (j < 0) return;
+    Ship* e = &env->ships[j];
+
+    float dx = sm_wrap_delta(e->x - s->x, env->size);
+    float dy = sm_wrap_delta(e->y - s->y, env->size);
+    float dist = sqrtf(dx*dx + dy*dy);
+    float r = 0.0f;
+
+    if (s->attack_state == SM_STATE_APPROACH) {
+        // Shaping toward the firing band [attack_range_min, attack_range_max]
+        float band_now = fmaxf(0.0f, dist - env->attack_range_max)
+            + fmaxf(0.0f, env->attack_range_min - dist);
+        if (s->prev_enemy_dist >= 0.0f) {
+            float band_prev = fmaxf(0.0f, s->prev_enemy_dist - env->attack_range_max)
+                + fmaxf(0.0f, env->attack_range_min - s->prev_enemy_dist);
+            r += env->engage_scale * (band_prev - band_now) / env->size;
+        }
+
+        int in_band = dist >= env->attack_range_min && dist <= env->attack_range_max;
+        float bearing = atan2f(dy, dx);
+        float aim_err = fabsf(atan2f(sinf(s->heading - bearing), cosf(s->heading - bearing)));
+        int on_target = in_band && aim_err <= env->aim_cone
+            && sm_los_clear(env, s->x, s->y, e->x, e->y);
+
+        if (on_target) {
+            s->aim_progress += 1;
+            r += env->aim_reward;
+            // Transverse velocity while aiming: a drifting, strafing shooter
+            // is a harder target than one hanging still on the firing line
+            float inv = dist > 1e-5f ? 1.0f / dist : 0.0f;
+            float v_perp = fabsf(s->vx * (-dy * inv) + s->vy * (dx * inv));
+            r += env->strafe_reward * sm_clampf(v_perp / env->max_speed, 0.0f, 1.0f);
+
+            if (s->aim_progress >= env->aim_ticks) {
+                r += env->fire_reward;
+                s->attack_passes += 1;
+                s->aim_progress = 0;
+                s->attack_state = SM_STATE_FLEE;
+                s->fire_flash = 14;
+                // Getting shot at teaches evasion and planet-shielding
+                env->rewards[j] -= env->targeted_penalty;
+                e->episode_return -= env->targeted_penalty;
+            }
+        } else if (s->aim_progress > 0) {
+            s->aim_progress -= 1;
+        }
+    } else {
+        // FLEE: you are the target now, open distance fast
+        if (s->prev_enemy_dist >= 0.0f) {
+            r += env->engage_scale * (dist - s->prev_enemy_dist) / env->size;
+        }
+        if (dist >= env->disengage_range) {
+            r += env->cycle_reward;
+            s->full_cycles += 1;
+            s->attack_state = SM_STATE_APPROACH;
+        }
+    }
+
+    s->prev_enemy_dist = dist;
+    env->rewards[i] += r;
+    s->episode_return += r;
 }
 
 // Reads this decision's button states and charges the jitter penalty.
@@ -492,6 +707,15 @@ static void sm_physics_tick(StarMelee* env) {
 
         if (s->hp <= 0.0f) {
             sm_finish_ship(env, i, -1.0f, SM_RESULT_CRASH);
+            continue;
+        }
+
+        if (env->combat) {
+            sm_combat_tick(env, i);
+            if (s->episode_tick >= env->max_ticks) {
+                // Surviving a duel to the buzzer is not a failure
+                sm_finish_ship(env, i, 0.0f, SM_RESULT_TIMEOUT);
+            }
             continue;
         }
 
@@ -708,8 +932,30 @@ void c_render(StarMelee* env) {
                       Fade(SM_SHIP_COLORS[i], alpha));
         }
 
-        sm_draw_wrapped(env, s->goal_x, s->goal_y, 40.0f, sm_draw_goal_sprite, i);
+        if (!env->combat) {
+            sm_draw_wrapped(env, s->goal_x, s->goal_y, 40.0f, sm_draw_goal_sprite, i);
+        }
         sm_draw_wrapped(env, s->x, s->y, 40.0f, sm_draw_ship_sprite, i);
+
+        // Aim beam toward the enemy: brightens with aim progress, flashes on fire
+        if (env->combat) {
+            int enemy = sm_nearest_enemy(env, i);
+            if (enemy >= 0 && (s->aim_progress > 0 || s->fire_flash > 0)) {
+                Ship* e = &env->ships[enemy];
+                float bdx = sm_wrap_delta(e->x - s->x, env->size);
+                float bdy = sm_wrap_delta(e->y - s->y, env->size);
+                Vector2 from = sm_world_to_screen(env, s->x, s->y);
+                Vector2 to = sm_world_to_screen(env, s->x + bdx, s->y + bdy);
+                if (s->fire_flash > 0) {
+                    s->fire_flash -= 1;
+                    DrawLineEx(from, to, 3.0f, Fade(SM_WHITE, s->fire_flash / 14.0f));
+                    DrawCircleV(to, 6.0f, Fade(SM_RED, s->fire_flash / 14.0f));
+                } else {
+                    float lock = (float)s->aim_progress / (float)env->aim_ticks;
+                    DrawLineEx(from, to, 1.0f, Fade(SM_SHIP_COLORS[i], 0.15f + 0.5f * lock));
+                }
+            }
+        }
 
         // Episode-end feedback text above the ship
         if (s->event_timer > 0) {
@@ -727,8 +973,16 @@ void c_render(StarMelee* env) {
     // HUD for ship 0
     Ship* s0 = &env->ships[0];
     float speed = sqrtf(s0->vx*s0->vx + s0->vy*s0->vy);
-    DrawRectangle(12, 10, 190, 104, Fade(BLACK, 0.35f));
-    DrawText("Fly to your beacon", 20, 16, 16, SM_WHITE);
+    DrawRectangle(12, 10, 190, env->combat ? 122 : 104, Fade(BLACK, 0.35f));
+    if (env->combat) {
+        DrawText("Duel: aim, fire, disengage", 20, 16, 16, SM_WHITE);
+        DrawText(TextFormat("%s  passes %d  cycles %d",
+            s0->attack_state == SM_STATE_FLEE ? "FLEE" : "ATTACK",
+            s0->attack_passes, s0->full_cycles), 20, 112, 12,
+            s0->attack_state == SM_STATE_FLEE ? SM_YELLOW : SM_GREEN);
+    } else {
+        DrawText("Fly to your beacon", 20, 16, 16, SM_WHITE);
+    }
     DrawText(TextFormat("speed %5.2f / %.1f", speed, env->max_speed), 20, 38, 14, SM_WHITE);
     DrawText(TextFormat("step  %d / %d", s0->episode_tick, env->max_ticks), 20, 56, 14, SM_WHITE);
     DrawText(TextFormat("hp    %3.0f", s0->hp), 20, 74, 14, SM_WHITE);

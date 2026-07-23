@@ -71,6 +71,19 @@ void my_init(Env* env, Dict* kwargs) {
     env->min_goal_frac = (float)dict_get(kwargs, "min_goal_frac")->value;
     env->input_change_penalty = (float)dict_get(kwargs, "input_change_penalty")->value;
     env->action_repeat = (int)dict_get(kwargs, "action_repeat")->value;
+    env->combat = (int)dict_get(kwargs, "combat")->value;
+    env->attack_range_min = (float)dict_get(kwargs, "attack_range_min")->value;
+    env->attack_range_max = (float)dict_get(kwargs, "attack_range_max")->value;
+    env->aim_cone = (float)dict_get(kwargs, "aim_cone")->value;
+    env->aim_ticks = (int)dict_get(kwargs, "aim_ticks")->value;
+    env->disengage_range = (float)dict_get(kwargs, "disengage_range")->value;
+    env->engage_scale = (float)dict_get(kwargs, "engage_scale")->value;
+    env->aim_reward = (float)dict_get(kwargs, "aim_reward")->value;
+    env->strafe_reward = (float)dict_get(kwargs, "strafe_reward")->value;
+    env->fire_reward = (float)dict_get(kwargs, "fire_reward")->value;
+    env->cycle_reward = (float)dict_get(kwargs, "cycle_reward")->value;
+    env->targeted_penalty = (float)dict_get(kwargs, "targeted_penalty")->value;
+    env->duel_spawn_frac = (float)dict_get(kwargs, "duel_spawn_frac")->value;
     c_init(env);
 }
 
@@ -85,4 +98,6 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "final_distance", log->final_distance);
     dict_set(out, "planet_hits", log->planet_hits);
     dict_set(out, "input_changes", log->input_changes);
+    dict_set(out, "attack_passes", log->attack_passes);
+    dict_set(out, "full_cycles", log->full_cycles);
 }
