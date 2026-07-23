@@ -180,7 +180,7 @@ struct PPOBuffersPuf {
 };
 
 void register_ppo_buffers(PPOBuffersPuf& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous) {
-    long total = (long)N * T;
+    int64_t total = (int64_t)N * T;
     bufs = PPOBuffersPuf{
         .loss_output = {.shape = {1}},
         .grad_loss = {.shape = {1}},
@@ -282,7 +282,7 @@ typedef struct {
     // Training
     int minibatch_size;
     float replay_ratio;
-    long total_timesteps;
+    int64_t total_timesteps;  // sweeps configure up to 1e11; long is 32-bit on Windows
     float max_grad_norm;
     // PPO
     float clip_coef;
@@ -367,11 +367,11 @@ typedef struct {
     LongTensor rng_offset_puf;   // (num_buffers+1,) int64 CUDA device counters
     ProfileT profile;
     nvmlDevice_t nvml_device;
-    long epoch;
-    long global_step;
+    int64_t epoch;
+    int64_t global_step;
     double start_time;
     double last_log_time;
-    long last_log_step;
+    int64_t last_log_step;
     int train_warmup;
     bool rollout_captured;
     bool train_captured;
@@ -625,7 +625,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     OBS_TENSOR_T& obs_env = env.obs;
     int n = block_size * obs_env.shape[1];
     PrecisionTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
-    cast_dispatch(obs_dst.data, obs_env.data + (long)start*obs_env.shape[1], n, stream);
+    cast_dispatch(obs_dst.data, obs_env.data + (int64_t)start*obs_env.shape[1], n, stream);
 
     PrecisionTensor rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
     n = block_size;
@@ -646,7 +646,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         int mask_n = block_size * mask_size;
         cast<<<grid_size(mask_n), BLOCK_SIZE, 0, stream>>>(
             mask_slice.data,
-            env.action_mask.data + (long)start * mask_size,
+            env.action_mask.data + (int64_t)start * mask_size,
             mask_n);
     }
 
@@ -655,7 +655,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     // per-buffer-relative so each worker writes only inside its own chunk.
     // Cudagraph capture absorbs the extra kernel launches.
     int num_banks = 1 + pufferl->num_frozen_banks;
-    long act_cols = env.actions.shape[1];
+    int64_t act_cols = env.actions.shape[1];
     for (int b = 0; b < num_banks; b++) {
         int bank_off = pufferl->bank_layout ? pufferl->bank_layout[b] : 0;
         int bank_end = pufferl->bank_layout ? pufferl->bank_layout[b + 1] : block_size;
@@ -707,7 +707,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             mask_b.data, mask_stride_b);
 
         cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
-                env.actions.data + (long)sub_start * act_cols,
+                env.actions.data + (int64_t)sub_start * act_cols,
                 act_b.data, numel(act_b.shape));
     }
 
@@ -1489,7 +1489,7 @@ __global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
     }
 }
 
-inline float cosine_annealing(float lr_base, float lr_min, long t, long T) {
+inline float cosine_annealing(float lr_base, float lr_min, int64_t t, int64_t T) {
     if (T == 0) return lr_base;
     float ratio = (double )t / (double) T;
     ratio = std::max(0.0f, std::min(1.0f, ratio));
