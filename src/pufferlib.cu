@@ -2238,8 +2238,12 @@ void close_impl(PuffeRL& pufferl) {
     }
 
     cudaGraphExecDestroy(pufferl.train_cudagraph);
-    for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
-        cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+    // NULL when cudagraphs < 0 (eager mode): the array is only allocated in
+    // create_pufferl when graph capture is enabled.
+    if (pufferl.fused_rollout_cudagraphs != NULL) {
+        for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
+            cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+        }
     }
 
     policy_weights_free(&pufferl.policy, &pufferl.weights);

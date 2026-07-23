@@ -264,7 +264,11 @@ if(PUFFER_MODE STREQUAL "cuda" OR PUFFER_MODE STREQUAL "profile")
         set(CMAKE_CUDA_ARCHITECTURES native)
     endif()
     set(CMAKE_CUDA_STANDARD 20)
-    set(CMAKE_CUDA_FLAGS_RELEASE "-O2 --threads 0 -DNDEBUG")
+    # No -DNDEBUG here (parity with build.sh NVCC_OPT): pufferlib.cu wraps
+    # cudaGraph capture/instantiate/launch calls in assert(), so NDEBUG
+    # compiles the entire CUDA-graph machinery out and training silently
+    # stops updating weights after the capture epoch.
+    set(CMAKE_CUDA_FLAGS_RELEASE "-O2 --threads 0")
     find_package(CUDAToolkit REQUIRED)
     find_package(CUDNN REQUIRED)
     find_package(NCCL)  # optional; absent on Windows -> multi-GPU compiled out
