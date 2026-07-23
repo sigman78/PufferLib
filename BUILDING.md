@@ -78,16 +78,15 @@ Windows notes:
   env code on Windows. Note UCRT's `RAND_MAX` is 0x7FFF while the shimmed
   generators emit glibc's 31-bit range; the shim raises `RAND_MAX` to match,
   so `rand()/RAND_MAX` idioms behave like they do on Linux.
-- Known issue: the native CUDA training backend does not learn on Windows
-  yet. Rollouts, env stepping, and weight updates all run, but the train-time
-  policy recompute disagrees with rollout-time logprobs from the first epoch
-  (`clipfrac` starts at 1.0, `old_kl` ~7), so PPO ratios are meaningless and
-  the policy stays at random-level performance. Additionally, the CUDA-graph
-  path (`cudagraphs >= 0`, the default) fails at `cudaGraphLaunch` after the
-  capture epoch. Until fixed, train on Windows with the PyTorch backend:
-  build with `-Float` and run `puffer train <env> --slowly` (verified
-  learning, e.g. starmelee reaches 96% success). For the native backend, use
-  `--cudagraphs -1` to at least run eagerly while debugging.
+- The native CUDA trainer works on Windows (verified learning with CUDA
+  graphs enabled). Historical note for future LLP64 debugging: it used to
+  train at random level forever because `alloc_register(LongTensor*)` sized
+  arena slots with `sizeof(long)` (4 bytes on Windows, 8 on Linux), letting
+  the int64 RNG counters overwrite the adjacent `act_sizes` tensor every
+  step. When adding `long`-typed sizes/offsets to the CUDA sources, use
+  `int64_t` — Windows `long` is 32-bit.
+- The PyTorch backend (`--slowly`, requires a `-Float` build) remains
+  available as a slower cross-check for trainer-side debugging.
 
 ## Web builds (emscripten) — TODO
 
