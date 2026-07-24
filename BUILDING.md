@@ -63,9 +63,36 @@ Windows notes:
 
 - Multi-GPU is unavailable (NCCL is Linux-only); training is single-GPU.
 - OpenMP is disabled inside the extension on Windows: torch's wheels ship
-  Intel's OpenMP runtime and loading LLVM's libomp alongside it aborts the
-  process (OMP Error #15). Env stepping still parallelizes across vecenv
-  buffer threads. Standalone executables do use OpenMP.
+  Intel's OpenMP runtime (`libiomp5md.dll`) and loading LLVM's `libomp`
+  alongside it aborts the process (OMP Error #15). Standalone executables
+  do use OpenMP.
+
+  Consequence (found 2026-07-24): the vecenv's intra-buffer env-step loop
+  was an `omp parallel for`, so without OpenMP each buffer stepped all of
+  its envs on ONE core — `[vec] num_threads` was a dead knob, CPU sat ~2%
+  busy, and the GPU pipeline stalled behind a single-threaded simulator.
+  Fix: `StaticEnvPool` in `src/vecenv.h`, a pthread-shim worker pool
+  (atomic work-stealing cursor, generation-bump release, hard-spin waits)
+  compiled only when `_OPENMP` is absent. Linux builds and standalone exes
+  keep the OpenMP path. `num_threads / num_buffers` = env-step workers per
+  buffer; on a 20-core box, `num_threads = 16` took starmelee from 1.6M to
+  4.8M SPS (Env wall share 70% -> 43%, GPU util ~22% -> 65%).
+
+  Alternatives considered for re-enabling real OpenMP in the extension
+  (all build-only, none adopted):
+  1. Link the extension against torch's own runtime: compile with
+     `/openmp:llvm` (MSVC) or `-fopenmp` (clang) and link an import
+     library generated from `torch/lib/libiomp5md.dll` (LLVM's libomp is
+     ABI-compatible with Intel's — same `__kmpc_*` entry points). One
+     runtime in-process, no Error #15. Cleanest option, but couples the
+     build to torch's runtime-shipping choices.
+  2. MSVC `/openmp` (vcomp140): a separate runtime family that does not
+     trip Intel's duplicate detection and coexists with libiomp5md. Two
+     thread pools in-process; OpenMP 2.0 only (sufficient here).
+  3. `KMP_DUPLICATE_LIB_OK=TRUE`: documented-unsafe, ruled out.
+  Decision: keep the pthread pool — measured equal-or-better (its dynamic
+  cursor load-balances variable-cost env steps better than
+  `schedule(static)`), zero runtime politics, portable.
 - Environments that don't build on Windows yet: `nethack` (Linux syscalls),
   `chess` (fork/exec engine), `boxoban` (mmap), `impulse_wars` (no Windows
   box2d prebuilt), `trailer` (fork/wait), `onlyfish` standalone (dirent).
