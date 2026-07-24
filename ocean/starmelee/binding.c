@@ -81,21 +81,24 @@ void my_init(Env* env, Dict* kwargs) {
     env->attack_range_min = (float)dict_get(kwargs, "attack_range_min")->value;
     env->attack_range_max = (float)dict_get(kwargs, "attack_range_max")->value;
     env->aim_cone = (float)dict_get(kwargs, "aim_cone")->value;
-    env->aim_ticks = (int)dict_get(kwargs, "aim_ticks")->value;
     env->disengage_range = (float)dict_get(kwargs, "disengage_range")->value;
     env->engage_scale = (float)dict_get(kwargs, "engage_scale")->value;
     env->aim_reward = (float)dict_get(kwargs, "aim_reward")->value;
     env->strafe_reward = (float)dict_get(kwargs, "strafe_reward")->value;
-    env->fire_reward = (float)dict_get(kwargs, "fire_reward")->value;
+    env->hit_reward = (float)dict_get(kwargs, "hit_reward")->value;
     env->cycle_reward = (float)dict_get(kwargs, "cycle_reward")->value;
     env->targeted_penalty = (float)dict_get(kwargs, "targeted_penalty")->value;
     env->shot_damage = (float)dict_get(kwargs, "shot_damage")->value;
     env->duel_spawn_frac = (float)dict_get(kwargs, "duel_spawn_frac")->value;
     env->trait_variation = (float)dict_get(kwargs, "trait_variation")->value;
-    env->reengage_ticks = (int)dict_get(kwargs, "reengage_ticks")->value;
     env->loiter_reward = (float)dict_get(kwargs, "loiter_reward")->value;
     env->retreat_hp_frac = (float)dict_get(kwargs, "retreat_hp_frac")->value;
     env->hp_regen = (float)dict_get(kwargs, "hp_regen")->value;
+    env->cannon_rounds = (int)dict_get(kwargs, "cannon_rounds")->value;
+    env->cannon_interval_ticks = (int)dict_get(kwargs, "cannon_interval_ticks")->value;
+    env->cannon_reload_ticks = (int)dict_get(kwargs, "cannon_reload_ticks")->value;
+    env->projectile_speed = (float)dict_get(kwargs, "projectile_speed")->value;
+    env->projectile_range = (float)dict_get(kwargs, "projectile_range")->value;
     env->num_asteroids = (int)dict_get(kwargs, "num_asteroids")->value;
     env->asteroid_radius = (float)dict_get(kwargs, "asteroid_radius")->value;
     env->asteroid_damage = (float)dict_get(kwargs, "asteroid_damage")->value;
@@ -118,7 +121,9 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "planet_hits", log->planet_hits);
     dict_set(out, "input_changes", log->input_changes);
     dict_set(out, "attack_passes", log->attack_passes);
+    dict_set(out, "shots_fired", log->shots_fired);
     dict_set(out, "full_cycles", log->full_cycles);
     dict_set(out, "retreats", log->retreats);
     dict_set(out, "asteroid_hits", log->asteroid_hits);
+    dict_set(out, "asteroid_kills", log->asteroid_kills);
 }

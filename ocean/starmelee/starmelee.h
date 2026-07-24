@@ -3,6 +3,9 @@
 // planet. Ships are torque/thrust driven: hold left/right to apply angular
 // acceleration, hold engine to accelerate along the heading. The planet pulls
 // with inverse-square gravity and bounces ships off with damage.
+// Combat mode: duel with a real cannon — short-range projectiles fired in
+// bursts, a reload that forces a flee-and-return rhythm, and asteroids that
+// double as destructible cover.
 #pragma once
 
 #include <math.h>
@@ -10,16 +13,16 @@
 #include <string.h>
 #include "raylib.h"
 
-#define STARMELEE_OBS_SIZE 44
-#define STARMELEE_OBS_ASTEROIDS 2  // rocks with their own stable obs slots
+#define STARMELEE_OBS_SIZE 62
+#define STARMELEE_OBS_ASTEROIDS 4  // rocks with their own stable obs slots
 #define STARMELEE_MAX_SHIPS 8
 #define STARMELEE_MAX_ASTEROIDS 8
+#define STARMELEE_MAX_PROJECTILES 32
 #define STARMELEE_TRAIL_LEN 48
 
 const unsigned char SM_STATE_APPROACH = 0;
-const unsigned char SM_STATE_FLEE = 1;
-const unsigned char SM_STATE_REGROUP = 2;
-const unsigned char SM_STATE_RETREAT = 3;  // low hp: survival first
+const unsigned char SM_STATE_FLEE = 1;     // magazine empty: reload while opening distance
+const unsigned char SM_STATE_RETREAT = 2;  // low hp: survival first
 
 const unsigned char SM_RESULT_SUCCESS = 0;
 const unsigned char SM_RESULT_CRASH = 1;
@@ -37,12 +40,26 @@ typedef struct {
     float final_distance;
     float planet_hits;
     float input_changes;  // button toggles per step (jitter measure)
-    float attack_passes;  // combat: completed aim-and-fire passes
-    float full_cycles;    // combat: fire followed by clean disengage
+    float attack_passes;  // combat: projectile hits landed on the enemy
+    float shots_fired;    // combat: cannon rounds fired
+    float full_cycles;    // combat: burst followed by a clean disengage
     float retreats;       // combat: times low hp forced a retreat
     float asteroid_hits;  // asteroid impacts taken
+    float asteroid_kills; // rocks broken by this ship's cannon fire
     float n;
 } Log;
+
+// Cannon round: straight-line flight (gravity does not bend shots), inherits
+// the shooter's velocity at launch, dissolves at end of life or on any
+// contact (planet, rock, ship). Rocks it hits disintegrate.
+typedef struct {
+    float x;
+    float y;
+    float vx;
+    float vy;
+    int owner;
+    int life;    // remaining ticks; <= 0 means the slot is free
+} Projectile;
 
 // Straight-line hazard: deliberately ignores gravity, disintegrates on any
 // contact (ship or planet) and respawns later with a fresh trajectory
@@ -86,15 +103,21 @@ typedef struct {
     unsigned char last_result;
     int event_timer;  // render-only feedback countdown
     // combat mode
-    unsigned char attack_state;  // APPROACH / FLEE / REGROUP / RETREAT
-    int aim_progress;            // consecutive-ish on-target ticks
-    int reengage_timer;          // REGROUP cooldown remaining, ticks
-    int attack_passes;
+    unsigned char attack_state;  // APPROACH / FLEE / RETREAT
+    int ammo;                    // rounds left in the magazine
+    int cannon_timer;            // ticks until the next round (or reload end)
+    unsigned char reloading;     // 1 while the 2 s reload runs (FLEE driver)
+    unsigned char cycle_paid;    // this FLEE already resolved its cycle
+    int hits_this_mag;           // hits landed by the current magazine
+    int attack_passes;           // projectile hits landed
+    int shots_fired;
+    int asteroid_kills;
     int full_cycles;
     int retreats;
     float prev_enemy_dist;       // < 0 until first combat tick
     unsigned char just_finished; // episode ended this decision window
     int fire_flash;              // render-only muzzle flash countdown
+    int hit_flash;               // render-only got-hit countdown
     // Per-spawn trait multipliers (1.0 +- trait_variation), observable by
     // the ship itself so the shared policy can act on its own build
     float t_thrust;
@@ -139,24 +162,29 @@ typedef struct {
 
     // combat (duel) mode
     int combat;            // 0 = navigate to beacon, 1 = duel the other ship
-    float attack_range_min;  // firing band, world units
+    float attack_range_min;  // engagement band, world units
     float attack_range_max;
-    float aim_cone;          // max bearing error while aiming, rad
-    int aim_ticks;           // on-target ticks needed to complete a pass
+    float aim_cone;          // max bearing error that counts as tracking, rad
     float disengage_range;   // flee distance that completes a cycle
     float engage_scale;      // shaping scale for band-approach / flee distance
-    float aim_reward;        // per on-target tick
-    float strafe_reward;     // per tick, scaled by transverse speed while aiming
-    float fire_reward;       // completing an aim pass
+    float aim_reward;        // per tracking tick inside the band
+    float strafe_reward;     // per tick, scaled by transverse speed while tracking
+    float hit_reward;        // landing a projectile on the enemy
     float cycle_reward;      // completing the disengage
-    float targeted_penalty;  // charged to the ship that got fired at
-    float shot_damage;       // hp a completed pass takes off the victim
+    float targeted_penalty;  // charged to the ship a projectile hit
+    float shot_damage;       // hp a projectile hit takes off the victim
     float duel_spawn_frac;   // spawn separation as a fraction of size
     float trait_variation;   // +- range of per-spawn trait multipliers, 0..0.5
-    int reengage_ticks;      // REGROUP cooldown after a disengage
-    float loiter_reward;     // per tick spent beyond disengage_range in REGROUP
+    float loiter_reward;     // per tick spent beyond disengage_range while off duty
     float retreat_hp_frac;   // hp fraction that forces RETREAT; 0 disables
     float hp_regen;          // hp per tick while beyond disengage_range
+
+    // cannon (combat mode)
+    int cannon_rounds;         // magazine size
+    int cannon_interval_ticks; // ticks between rounds within a burst
+    int cannon_reload_ticks;   // ticks to refill an empty magazine
+    float projectile_speed;    // muzzle speed added along the heading
+    float projectile_range;    // flight distance at muzzle speed before dissolving
 
     // asteroids (0 = off)
     int num_asteroids;
@@ -169,6 +197,7 @@ typedef struct {
 
     Ship ships[STARMELEE_MAX_SHIPS];
     Asteroid asteroids[STARMELEE_MAX_ASTEROIDS];
+    Projectile projectiles[STARMELEE_MAX_PROJECTILES];
     unsigned int rng;
 
     // render-only state (untouched during training)
@@ -258,7 +287,6 @@ void c_init(StarMelee* env) {
     }
     env->aim_cone = sm_clampf(env->aim_cone, 0.0f, 1.0f);
     if (env->aim_cone == 0.0f) env->aim_cone = 0.15f;
-    if (env->aim_ticks < 1) env->aim_ticks = 30;
     env->disengage_range = fminf(env->disengage_range, 0.45f * env->size);
     if (env->disengage_range <= env->attack_range_max) {
         env->disengage_range = fminf(2.0f * env->attack_range_max, 0.45f * env->size);
@@ -269,14 +297,13 @@ void c_init(StarMelee* env) {
     if (env->engage_scale == 0.0f) env->engage_scale = 2.0f;
     if (env->aim_reward < 0.0f) env->aim_reward = 0.0f;
     if (env->strafe_reward < 0.0f) env->strafe_reward = 0.0f;
-    if (env->fire_reward == 0.0f) env->fire_reward = 1.0f;
+    if (env->hit_reward == 0.0f) env->hit_reward = 0.75f;
     if (env->cycle_reward == 0.0f) env->cycle_reward = 0.5f;
     if (env->targeted_penalty < 0.0f) env->targeted_penalty = 0.0f;
     env->duel_spawn_frac = sm_clampf(env->duel_spawn_frac, 0.0f, 0.45f);
     if (env->duel_spawn_frac == 0.0f) env->duel_spawn_frac = 0.35f;
     if (env->combat && env->num_ships < 2) env->combat = 0;
     env->trait_variation = sm_clampf(env->trait_variation, 0.0f, 0.5f);
-    if (env->reengage_ticks <= 0) env->reengage_ticks = 180;
     if (env->loiter_reward < 0.0f) env->loiter_reward = 0.0f;
     env->retreat_hp_frac = sm_clampf(env->retreat_hp_frac, 0.0f, 0.9f);
     if (env->hp_regen < 0.0f) env->hp_regen = 0.0f;
@@ -285,9 +312,22 @@ void c_init(StarMelee* env) {
     if (env->retreat_hp_frac > 0.0f && env->hp_regen == 0.0f) env->hp_regen = 0.1f;
     if (env->shot_damage < 0.0f) env->shot_damage = 0.0f;
 
+    // Cannon: magazine bounded so all rounds of every ship fit the pool.
+    if (env->cannon_rounds < 1) env->cannon_rounds = 3;
+    int rounds_cap = STARMELEE_MAX_PROJECTILES / STARMELEE_MAX_SHIPS;
+    if (env->cannon_rounds > rounds_cap) env->cannon_rounds = rounds_cap;
+    if (env->cannon_interval_ticks < 1) env->cannon_interval_ticks = 30;
+    if (env->cannon_reload_ticks < 1) env->cannon_reload_ticks = 120;
+    if (env->projectile_speed <= 0.0f) env->projectile_speed = 1.5f * env->max_speed;
+    if (env->projectile_range <= 0.0f) env->projectile_range = 8.0f * env->ship_radius;
+    // Shots must be able to cross the engagement band they are fired in
+    env->projectile_range = fmaxf(env->projectile_range, env->attack_range_max);
+
     if (env->num_asteroids < 0) env->num_asteroids = 0;
-    if (env->num_asteroids > STARMELEE_MAX_ASTEROIDS) {
-        env->num_asteroids = STARMELEE_MAX_ASTEROIDS;
+    // Every rock must own an obs slot: an unobservable lethal hazard is
+    // noise the policy cannot learn around
+    if (env->num_asteroids > STARMELEE_OBS_ASTEROIDS) {
+        env->num_asteroids = STARMELEE_OBS_ASTEROIDS;
     }
     if (env->asteroid_radius <= 0.0f) env->asteroid_radius = 7.0f;
     if (env->asteroid_damage < 0.0f) env->asteroid_damage = 20.0f;
@@ -438,12 +478,18 @@ static void sm_spawn_ship(StarMelee* env, int i) {
     s->turning_left = 0;
     s->turning_right = 0;
     s->attack_state = SM_STATE_APPROACH;
-    s->aim_progress = 0;
+    s->ammo = env->cannon_rounds;
+    s->cannon_timer = 0;
+    s->reloading = 0;
+    s->cycle_paid = 0;
+    s->hits_this_mag = 0;
     s->attack_passes = 0;
+    s->shots_fired = 0;
+    s->asteroid_kills = 0;
     s->full_cycles = 0;
     s->prev_enemy_dist = -1.0f;
     s->fire_flash = 0;
-    s->reengage_timer = 0;
+    s->hit_flash = 0;
     s->retreats = 0;
     s->t_thrust = sm_trait(env);
     s->t_turn = sm_trait(env);
@@ -565,6 +611,106 @@ static void sm_asteroids_tick(StarMelee* env) {
     }
 }
 
+// Chamber a round: the shot inherits the shooter's velocity plus muzzle
+// speed along the heading, and lives long enough to cover projectile_range
+// at muzzle speed. Pool never overflows: c_init caps cannon_rounds so all
+// rounds of every ship fit.
+static void sm_fire_projectile(StarMelee* env, int i) {
+    Ship* s = &env->ships[i];
+    for (int k = 0; k < STARMELEE_MAX_PROJECTILES; k++) {
+        Projectile* p = &env->projectiles[k];
+        if (p->life > 0) continue;
+        float dirx = cosf(s->heading);
+        float diry = sinf(s->heading);
+        p->x = sm_wrap_pos(s->x + dirx * (env->ship_radius + 2.0f), env->size);
+        p->y = sm_wrap_pos(s->y + diry * (env->ship_radius + 2.0f), env->size);
+        p->vx = s->vx + env->projectile_speed * dirx;
+        p->vy = s->vy + env->projectile_speed * diry;
+        p->owner = i;
+        // Life from the actual launch speed, not the nominal muzzle speed:
+        // inherited velocity must not stretch (or starve) the world-frame
+        // reach the ini advertises. At least one tick so no round is a dud.
+        float launch = sqrtf(p->vx*p->vx + p->vy*p->vy);
+        p->life = (int)(env->projectile_range / fmaxf(launch, 0.1f) + 0.5f);
+        if (p->life < 1) p->life = 1;
+        s->shots_fired += 1;
+        s->fire_flash = 10;
+        return;
+    }
+}
+
+// True when the minimal-image segment from (ax, ay) along (dx, dy) passes
+// within r of the point (cx, cy). Used as a swept collision test: closing
+// speeds can exceed a ship radius per tick, so point sampling tunnels.
+static inline int sm_sweep_hits(StarMelee* env, float ax, float ay,
+        float dx, float dy, float cx, float cy, float r) {
+    float px = sm_wrap_delta(cx - ax, env->size);
+    float py = sm_wrap_delta(cy - ay, env->size);
+    float len2 = dx*dx + dy*dy;
+    float t = len2 > 1e-6f ? (px*dx + py*dy) / len2 : 0.0f;
+    t = sm_clampf(t, 0.0f, 1.0f);
+    float ex = t*dx - px;
+    float ey = t*dy - py;
+    return ex*ex + ey*ey < r*r;
+}
+
+// One straight-line tick per shot: dissolve at end of life, on the planet
+// (the line-of-sight shield is physical), on a rock (which disintegrates),
+// or on a ship (damage + sting to the victim, hit_reward to the shooter).
+static void sm_projectiles_tick(StarMelee* env) {
+    for (int k = 0; k < STARMELEE_MAX_PROJECTILES; k++) {
+        Projectile* p = &env->projectiles[k];
+        if (p->life <= 0) continue;
+        p->life -= 1;
+        float from_x = p->x;
+        float from_y = p->y;
+        p->x = sm_wrap_pos(p->x + p->vx, env->size);
+        p->y = sm_wrap_pos(p->y + p->vy, env->size);
+
+        if (sm_torus_dist(env, p->x, p->y, sm_planet_x(env), sm_planet_y(env))
+                < env->planet_radius) {
+            p->life = 0;
+            continue;
+        }
+
+        int consumed = 0;
+        for (int r = 0; r < env->num_asteroids; r++) {
+            Asteroid* a = &env->asteroids[r];
+            if (!a->active) continue;
+            if (sm_sweep_hits(env, from_x, from_y, p->vx, p->vy, a->x, a->y, a->radius)) {
+                sm_destroy_asteroid(env, r);
+                env->ships[p->owner].asteroid_kills += 1;
+                p->life = 0;
+                consumed = 1;
+                break;
+            }
+        }
+        if (consumed) continue;
+
+        for (int i = 0; i < env->num_ships; i++) {
+            if (i == p->owner) continue;
+            Ship* s = &env->ships[i];
+            if (s->just_finished) continue;
+            if (!sm_sweep_hits(env, from_x, from_y, p->vx, p->vy, s->x, s->y,
+                    env->ship_radius)) {
+                continue;
+            }
+            s->hp -= env->shot_damage * s->t_fragility;
+            s->hit_flash = 12;
+            float sting = env->targeted_penalty * s->t_caution;
+            env->rewards[i] -= sting;
+            s->episode_return -= sting;
+            Ship* owner = &env->ships[p->owner];
+            env->rewards[p->owner] += env->hit_reward;
+            owner->episode_return += env->hit_reward;
+            owner->attack_passes += 1;
+            owner->hits_this_mag += 1;
+            p->life = 0;
+            break;
+        }
+    }
+}
+
 void compute_observations(StarMelee* env) {
     float half = 0.5f * env->size;
     float half_diag = 0.70711f * env->size;
@@ -609,6 +755,7 @@ void compute_observations(StarMelee* env) {
             Ship* o = &env->ships[nearest];
             float odx = sm_wrap_delta(o->x - s->x, env->size);
             float ody = sm_wrap_delta(o->y - s->y, env->size);
+            float odist = sqrtf(odx*odx + ody*ody);
             obs[13] = odx / half;
             obs[14] = ody / half;
             // Both ships can move at up to 2*max_speed (hard cap)
@@ -618,25 +765,42 @@ void compute_observations(StarMelee* env) {
             if (env->combat) {
                 float bearing = atan2f(ody, odx);
                 float aim_delta = s->heading - bearing;
+                int los = sm_los_clear(env, s->x, s->y, o->x, o->y);
                 obs[18] = cosf(aim_delta);
                 obs[19] = sinf(aim_delta);
-                obs[20] = sm_los_clear(env, s->x, s->y, o->x, o->y) ? 1.0f : 0.0f;
-                obs[21] = s->attack_state == SM_STATE_FLEE ? 1.0f
-                    : (s->attack_state == SM_STATE_REGROUP ? 0.5f : 0.0f);
-                obs[22] = (float)s->aim_progress / (float)env->aim_ticks;
-                obs[23] = (float)o->aim_progress / (float)env->aim_ticks;
+                obs[20] = los ? 1.0f : 0.0f;
+                obs[21] = s->attack_state == SM_STATE_FLEE ? 1.0f : 0.0f;
+                obs[22] = (float)s->ammo / (float)env->cannon_rounds;
+                obs[23] = (float)o->ammo / (float)env->cannon_rounds;
                 obs[24] = cosf(o->heading);
                 obs[25] = sinf(o->heading);
-                obs[26] = s->attack_state == SM_STATE_REGROUP
-                    ? (float)s->reengage_timer / (float)env->reengage_ticks : 0.0f;
+                obs[26] = s->reloading
+                    ? (float)s->cannon_timer / (float)env->cannon_reload_ticks : 0.0f;
                 obs[32] = o->hp / env->hp_max;  // smell blood: press a wounded enemy
+                obs[34] = o->reloading ? 1.0f : 0.0f;  // their window of weakness
+                // Incoming fire imminent: the enemy is on duty with a
+                // chambered round, clear sight, weapon range, its nose on us
+                float back = atan2f(-ody, -odx);
+                float e_err = fabsf(atan2f(sinf(o->heading - back), cosf(o->heading - back)));
+                obs[35] = (o->attack_state == SM_STATE_APPROACH && o->ammo > 0
+                    && los && odist <= env->projectile_range
+                    && e_err <= env->aim_cone) ? 1.0f : 0.0f;
+                // Enemy range at combat scale: the arena-scale deltas in
+                // obs[13..14] compress the whole engagement into < 0.09
+                obs[36] = sm_clampf(odist / env->disengage_range, 0.0f, 2.0f);
             } else {
                 for (int k = 18; k < 27; k++) obs[k] = 0.0f;
                 obs[32] = 0.0f;
+                obs[34] = 0.0f;
+                obs[35] = 0.0f;
+                obs[36] = 0.0f;
             }
         } else {
             for (int k = 13; k < 27; k++) obs[k] = 0.0f;
             obs[32] = 0.0f;
+            obs[34] = 0.0f;
+            obs[35] = 0.0f;
+            obs[36] = 0.0f;
         }
 
         // Own build: the policy needs to know what ship it is flying
@@ -647,11 +811,36 @@ void compute_observations(StarMelee* env) {
         obs[31] = s->t_caution - 1.0f;
         obs[33] = s->attack_state == SM_STATE_RETREAT ? 1.0f : 0.0f;
 
+        // Nearest hostile shot in flight, normalized to weapon scale (not
+        // arena scale: a dodge decision lives entirely inside ~one range)
+        int best = -1;
+        float best_dist = 0.0f;
+        for (int k = 0; k < STARMELEE_MAX_PROJECTILES; k++) {
+            Projectile* p = &env->projectiles[k];
+            if (p->life <= 0 || p->owner == i) continue;
+            float d = sm_torus_dist(env, p->x, p->y, s->x, s->y);
+            if (best < 0 || d < best_dist) {
+                best = k;
+                best_dist = d;
+            }
+        }
+        if (best >= 0 && best_dist <= 2.0f * env->projectile_range) {
+            Projectile* p = &env->projectiles[best];
+            float pv_norm = env->projectile_speed + 2.0f * env->max_speed;
+            obs[37] = sm_wrap_delta(p->x - s->x, env->size) / env->projectile_range;
+            obs[38] = sm_wrap_delta(p->y - s->y, env->size) / env->projectile_range;
+            obs[39] = (p->vx - s->vx) / pv_norm;
+            obs[40] = (p->vy - s->vy) / pv_norm;
+            obs[41] = 1.0f;
+        } else {
+            for (int k = 37; k <= 41; k++) obs[k] = 0.0f;
+        }
+
         // Rocks in fixed slots keyed by asteroid index: a nearest-rock obs
         // flickers identity when two rocks trade places, which shreds the
         // apparent-velocity signal the policy needs to dodge
         for (int slot = 0; slot < STARMELEE_OBS_ASTEROIDS; slot++) {
-            int base = 34 + 5 * slot;
+            int base = 42 + 5 * slot;
             Asteroid* a = slot < env->num_asteroids ? &env->asteroids[slot] : NULL;
             if (a != NULL && a->active) {
                 obs[base + 0] = sm_wrap_delta(a->x - s->x, env->size) / half;
@@ -690,9 +879,11 @@ static void sm_add_log(StarMelee* env, Ship* s, unsigned char result) {
     env->log.final_distance += s->prev_goal_dist / env->size;
     env->log.planet_hits += s->planet_hits;
     env->log.attack_passes += (float)s->attack_passes;
+    env->log.shots_fired += (float)s->shots_fired;
     env->log.full_cycles += (float)s->full_cycles;
     env->log.retreats += (float)s->retreats;
     env->log.asteroid_hits += (float)s->asteroid_hits;
+    env->log.asteroid_kills += (float)s->asteroid_kills;
     env->log.input_changes += s->episode_tick > 0
         ? (float)s->input_changes / (float)s->episode_tick : 0.0f;
     env->log.n += 1.0f;
@@ -708,13 +899,22 @@ static void sm_finish_ship(StarMelee* env, int i, float reward, unsigned char re
     sm_add_log(env, s, result);
     sm_spawn_ship(env, i);
     env->ships[i].just_finished = 1;
+    // All in-flight rounds die with the episode: the finisher's own shots
+    // must not pay into its next episode, and shots chasing the finisher
+    // must not strafe the fresh spawn it teleported into.
+    for (int k = 0; k < STARMELEE_MAX_PROJECTILES; k++) {
+        env->projectiles[k].life = 0;
+    }
     // The respawn teleports this ship: opponents must re-baseline their
-    // distance shaping and drop any aim lock, or the jump mints phantom
-    // shaping/cycle rewards for them.
+    // distance shaping, and a pending flee-cycle is forfeit — the new
+    // spawn distance (duel_spawn_frac * size) can exceed disengage_range,
+    // which would complete the cycle for free.
     for (int j = 0; j < env->num_ships; j++) {
         if (j == i) continue;
         env->ships[j].prev_enemy_dist = -1.0f;
-        env->ships[j].aim_progress = 0;
+        if (env->ships[j].attack_state == SM_STATE_FLEE) {
+            env->ships[j].cycle_paid = 1;
+        }
     }
     if (IsWindowReady()) {
         env->ships[i].event_timer = 70;
@@ -731,14 +931,18 @@ void c_reset(StarMelee* env) {
     for (int k = 0; k < env->num_asteroids; k++) {
         sm_spawn_asteroid(env, k);
     }
+    for (int k = 0; k < STARMELEE_MAX_PROJECTILES; k++) {
+        env->projectiles[k].life = 0;
+    }
     compute_observations(env);
 }
 
-// One combat tick for ship i: the approach -> aim/fire -> flee cycle.
-// Aiming requires being inside the firing band with clear line of sight and
-// bearing within aim_cone; holding it for aim_ticks completes a pretend shot
-// (rewarding the shooter, penalizing the target), after which the ship must
-// open distance to disengage_range before re-engaging.
+// One combat tick for ship i: the engage -> burst -> reload-flee cycle.
+// The cannon fires by itself whenever the ship is on duty (APPROACH), has a
+// chambered round off cooldown, and is tracking the enemy — bearing inside
+// aim_cone with clear line of sight — within projectile_range. Emptying the
+// magazine starts the reload and forces FLEE: open distance (cycle_reward at
+// disengage_range) until the magazine refills. Low hp forces RETREAT on top.
 static void sm_combat_tick(StarMelee* env, int i) {
     Ship* s = &env->ships[i];
     int j = sm_nearest_enemy(env, i);
@@ -751,18 +955,43 @@ static void sm_combat_tick(StarMelee* env, int i) {
     float r = env->step_penalty;  // duels feel time pressure too
     float next_prev = dist;       // next tick's shaping baseline
 
+    // Cannon clock runs in every state; a finished reload releases FLEE
+    if (s->cannon_timer > 0) {
+        s->cannon_timer -= 1;
+        if (s->cannon_timer == 0 && s->reloading) {
+            s->ammo = env->cannon_rounds;
+            s->reloading = 0;
+            s->hits_this_mag = 0;
+            if (s->attack_state == SM_STATE_FLEE) {
+                s->attack_state = SM_STATE_APPROACH;
+                // Approach shaping only pays for the way back to the band;
+                // drifting far while reloading must not refill the well
+                next_prev = fminf(dist, env->disengage_range);
+            }
+        }
+    }
+
     // Low hp overrides everything: break off and survive. Hysteresis (exit
     // well above the entry threshold) stops flapping at the boundary.
     float retreat_enter = env->retreat_hp_frac * env->hp_max;
     if (retreat_enter > 0.0f && s->attack_state != SM_STATE_RETREAT
             && s->hp <= retreat_enter) {
         s->attack_state = SM_STATE_RETREAT;
-        s->aim_progress = 0;
         s->retreats += 1;
+        // Escape shaping must start from the real current distance: the
+        // stored baseline may still carry the release-time clamp, and the
+        // gap would mint phantom escape reward on this very tick
+        s->prev_enemy_dist = dist;
     }
 
+    // Tracking: nose on the enemy with nothing in the way
+    float bearing = atan2f(dy, dx);
+    float aim_err = fabsf(atan2f(sinf(s->heading - bearing), cosf(s->heading - bearing)));
+    int tracking = aim_err <= env->aim_cone
+        && sm_los_clear(env, s->x, s->y, e->x, e->y);
+
     if (s->attack_state == SM_STATE_APPROACH) {
-        // Shaping toward the firing band [attack_range_min, attack_range_max]
+        // Shaping toward the engagement band [attack_range_min, attack_range_max]
         float band_now = fmaxf(0.0f, dist - env->attack_range_max)
             + fmaxf(0.0f, env->attack_range_min - dist);
         if (s->prev_enemy_dist >= 0.0f) {
@@ -772,62 +1001,51 @@ static void sm_combat_tick(StarMelee* env, int i) {
         }
 
         int in_band = dist >= env->attack_range_min && dist <= env->attack_range_max;
-        float bearing = atan2f(dy, dx);
-        float aim_err = fabsf(atan2f(sinf(s->heading - bearing), cosf(s->heading - bearing)));
-        int on_target = in_band && aim_err <= env->aim_cone
-            && sm_los_clear(env, s->x, s->y, e->x, e->y);
-
-        if (on_target) {
-            s->aim_progress += 1;
+        if (in_band && tracking) {
             r += env->aim_reward;
-            // Transverse velocity while aiming: a drifting, strafing shooter
-            // is a harder target than one hanging still on the firing line
+            // Transverse velocity while tracking: a drifting, strafing
+            // shooter is a harder target than one hanging on the firing line
             float inv = dist > 1e-5f ? 1.0f / dist : 0.0f;
             float v_perp = fabsf(s->vx * (-dy * inv) + s->vy * (dx * inv));
             r += env->strafe_reward * sm_clampf(v_perp / env->max_speed, 0.0f, 1.0f);
+        }
 
-            if (s->aim_progress >= env->aim_ticks) {
-                r += env->fire_reward;
-                s->attack_passes += 1;
-                s->aim_progress = 0;
+        // Fire only when tracking the opponent inside weapon range
+        if (tracking && dist <= env->projectile_range
+                && s->ammo > 0 && s->cannon_timer == 0) {
+            sm_fire_projectile(env, i);
+            s->ammo -= 1;
+            if (s->ammo > 0) {
+                s->cannon_timer = env->cannon_interval_ticks;
+            } else {
+                // Magazine dry: reload forces the flee leg of the cycle
+                s->reloading = 1;
+                s->cannon_timer = env->cannon_reload_ticks;
+                s->cycle_paid = 0;
                 s->attack_state = SM_STATE_FLEE;
-                s->fire_flash = 14;
-                // Getting shot at teaches evasion and planet-shielding;
-                // cautious builds feel it more and should expose themselves
-                // less. Real hp damage keeps the exchange from being
-                // positive-sum for the pair: pure reward stings made
-                // cooperative shot-feeding the self-play optimum.
-                float sting = env->targeted_penalty * e->t_caution;
-                env->rewards[j] -= sting;
-                e->episode_return -= sting;
-                e->hp -= env->shot_damage * e->t_fragility;
             }
-        } else if (s->aim_progress > 0) {
-            s->aim_progress -= 1;
         }
     } else if (s->attack_state == SM_STATE_FLEE) {
-        // FLEE: you are the target now, open distance fast. The prev-dist
+        // FLEE: reloading and a target, open distance fast. The prev-dist
         // gate keeps an opponent-respawn teleport from completing a cycle.
-        if (s->prev_enemy_dist >= 0.0f) {
-            r += env->engage_scale * (dist - s->prev_enemy_dist) / env->size;
-            if (dist >= env->disengage_range) {
-                r += env->cycle_reward;
-                s->full_cycles += 1;
-                s->attack_state = SM_STATE_REGROUP;
-                s->reengage_timer = env->reengage_ticks;
+        // Once the cycle resolves, loiter takes over: distance shaping must
+        // not keep paying all the way to the far side of the torus.
+        if (!s->cycle_paid) {
+            if (s->prev_enemy_dist >= 0.0f) {
+                r += env->engage_scale * (dist - s->prev_enemy_dist) / env->size;
+                if (dist >= env->disengage_range) {
+                    s->cycle_paid = 1;
+                    // A cycle only counts if the magazine that forced it
+                    // drew blood: dumping guaranteed misses and running is
+                    // otherwise the shared policy's favorite payday
+                    if (s->hits_this_mag > 0) {
+                        r += env->cycle_reward;
+                        s->full_cycles += 1;
+                    }
+                }
             }
-        }
-    } else if (s->attack_state == SM_STATE_REGROUP) {
-        // REGROUP: weapons cooling down; loiter out wide before re-engaging
-        s->reengage_timer -= 1;
-        if (dist >= env->disengage_range) {
+        } else if (dist >= env->disengage_range) {
             r += env->loiter_reward;
-        }
-        if (s->reengage_timer <= 0) {
-            s->attack_state = SM_STATE_APPROACH;
-            // Approach shaping only pays for the disengage_range -> band leg;
-            // wandering far during the free cooldown must not refill the well
-            next_prev = fminf(dist, env->disengage_range);
         }
     } else {
         // RETREAT: wounded, escape shaping only until hp recovers
@@ -839,8 +1057,8 @@ static void sm_combat_tick(StarMelee* env, int i) {
         }
         float retreat_exit = fminf(env->retreat_hp_frac + 0.15f, 1.0f) * env->hp_max;
         if (s->hp >= retreat_exit) {
-            // Resume an interrupted weapons cooldown instead of skipping it
-            s->attack_state = s->reengage_timer > 0 ? SM_STATE_REGROUP : SM_STATE_APPROACH;
+            // Resume an interrupted reload-flee instead of skipping it
+            s->attack_state = s->reloading ? SM_STATE_FLEE : SM_STATE_APPROACH;
             if (s->attack_state == SM_STATE_APPROACH) {
                 next_prev = fminf(dist, env->disengage_range);
             }
@@ -976,6 +1194,7 @@ static void sm_physics_tick(StarMelee* env) {
     }
 
     sm_asteroids_tick(env);
+    sm_projectiles_tick(env);
 
     // Ship vs ship: equal masses, exchange normal velocity components
     for (int i = 0; i < n; i++) {
@@ -1183,6 +1402,19 @@ static void sm_draw_asteroid_sprite(StarMelee* env, float sx, float sy, float sc
     }
 }
 
+// Cannon round: a short streak along its velocity with a bright head
+static void sm_draw_projectile_sprite(StarMelee* env, float sx, float sy, float scale, int k) {
+    Projectile* p = &env->projectiles[k];
+    int owner = (p->owner >= 0 && p->owner < STARMELEE_MAX_SHIPS) ? p->owner : 0;
+    float spd = sqrtf(p->vx*p->vx + p->vy*p->vy);
+    float ux = spd > 1e-5f ? p->vx / spd : 1.0f;
+    float uy = spd > 1e-5f ? p->vy / spd : 0.0f;
+    float len = fmaxf(6.0f, 3.0f * scale);
+    DrawLineEx((Vector2){sx - ux * len, sy - uy * len}, (Vector2){sx, sy}, 2.0f,
+        Fade(SM_SHIP_COLORS[owner], 0.85f));
+    DrawCircleV((Vector2){sx, sy}, fmaxf(1.5f, 1.1f * scale), SM_WHITE);
+}
+
 // Basic disintegration burst: expanding fading ring plus radial shards
 static void sm_draw_boom_sprite(StarMelee* env, float sx, float sy, float scale, int k) {
     Asteroid* a = &env->asteroids[k];
@@ -1272,6 +1504,13 @@ void c_render(StarMelee* env) {
         }
     }
 
+    for (int k = 0; k < STARMELEE_MAX_PROJECTILES; k++) {
+        if (env->projectiles[k].life > 0) {
+            sm_draw_wrapped(env, env->projectiles[k].x, env->projectiles[k].y, 30.0f,
+                sm_draw_projectile_sprite, k);
+        }
+    }
+
     for (int i = 0; i < env->num_ships; i++) {
         Ship* s = &env->ships[i];
 
@@ -1301,24 +1540,20 @@ void c_render(StarMelee* env) {
         }
         sm_draw_wrapped(env, s->x, s->y, 40.0f, sm_draw_ship_sprite, i);
 
-        // Aim beam toward the enemy: brightens with aim progress, flashes on fire
-        if (env->combat) {
-            int enemy = sm_nearest_enemy(env, i);
-            if (enemy >= 0 && (s->aim_progress > 0 || s->fire_flash > 0)) {
-                Ship* e = &env->ships[enemy];
-                float bdx = sm_wrap_delta(e->x - s->x, env->size);
-                float bdy = sm_wrap_delta(e->y - s->y, env->size);
-                Vector2 from = sm_world_to_screen(env, s->x, s->y);
-                Vector2 to = sm_world_to_screen(env, s->x + bdx, s->y + bdy);
-                if (s->fire_flash > 0) {
-                    s->fire_flash -= 1;
-                    DrawLineEx(from, to, 3.0f, Fade(SM_WHITE, s->fire_flash / 14.0f));
-                    DrawCircleV(to, 6.0f, Fade(SM_RED, s->fire_flash / 14.0f));
-                } else {
-                    float lock = (float)s->aim_progress / (float)env->aim_ticks;
-                    DrawLineEx(from, to, 1.0f, Fade(SM_SHIP_COLORS[i], 0.15f + 0.5f * lock));
-                }
-            }
+        // Muzzle flash at the nose, hit flash around a struck ship
+        if (s->fire_flash > 0) {
+            s->fire_flash -= 1;
+            Vector2 c = sm_world_to_screen(env, s->x, s->y);
+            float nose = (env->ship_radius + 3.0f) * scale;
+            Vector2 fp = {c.x + cosf(s->heading) * nose, c.y + sinf(s->heading) * nose};
+            DrawCircleV(fp, 3.0f + 0.3f * s->fire_flash, Fade(SM_YELLOW, s->fire_flash / 10.0f));
+        }
+        if (s->hit_flash > 0) {
+            s->hit_flash -= 1;
+            Vector2 c = sm_world_to_screen(env, s->x, s->y);
+            DrawCircleLines((int)c.x, (int)c.y,
+                (env->ship_radius + 4.0f) * scale * (1.0f + 0.06f * (12 - s->hit_flash)),
+                Fade(SM_RED, s->hit_flash / 12.0f));
         }
 
         // Episode-end feedback text above the ship
@@ -1337,23 +1572,33 @@ void c_render(StarMelee* env) {
     // HUD for ship 0
     Ship* s0 = &env->ships[0];
     float speed = sqrtf(s0->vx*s0->vx + s0->vy*s0->vy);
-    DrawRectangle(12, 10, 190, env->combat ? 122 : 104, Fade(BLACK, 0.35f));
+    DrawRectangle(12, 10, 190, env->combat ? 140 : 104, Fade(BLACK, 0.35f));
     if (env->combat) {
-        DrawText("Duel: aim, fire, disengage", 20, 16, 16, SM_WHITE);
+        DrawText("Duel: close, shoot, disengage", 20, 16, 16, SM_WHITE);
         const char* state_name = "ATTACK";
         Color state_color = SM_GREEN;
         if (s0->attack_state == SM_STATE_FLEE) {
-            state_name = "FLEE";
+            state_name = "RELOAD-FLEE";
             state_color = SM_YELLOW;
-        } else if (s0->attack_state == SM_STATE_REGROUP) {
-            state_name = "REGROUP";
-            state_color = SM_CYAN;
         } else if (s0->attack_state == SM_STATE_RETREAT) {
             state_name = "RETREAT";
             state_color = SM_RED;
         }
-        DrawText(TextFormat("%s  passes %d  cycles %d",
-            state_name, s0->attack_passes, s0->full_cycles), 20, 112, 12, state_color);
+        DrawText(TextFormat("%s  hits %d/%d  cycles %d", state_name,
+            s0->attack_passes, s0->shots_fired, s0->full_cycles), 20, 112, 12, state_color);
+        // Magazine pips, or the reload bar while it refills
+        if (s0->reloading) {
+            float frac = 1.0f - (float)s0->cannon_timer / (float)env->cannon_reload_ticks;
+            DrawText("reload", 20, 128, 12, SM_YELLOW);
+            DrawRectangle(70, 130, 100, 8, Fade(SM_WHITE, 0.15f));
+            DrawRectangle(70, 130, (int)(100 * frac), 8, SM_YELLOW);
+        } else {
+            DrawText("ammo", 20, 128, 12, SM_WHITE);
+            for (int a = 0; a < env->cannon_rounds; a++) {
+                Color pip = a < s0->ammo ? SM_GREEN : Fade(SM_WHITE, 0.2f);
+                DrawRectangle(70 + 14 * a, 130, 10, 8, pip);
+            }
+        }
     } else {
         DrawText("Fly to your beacon", 20, 16, 16, SM_WHITE);
     }
