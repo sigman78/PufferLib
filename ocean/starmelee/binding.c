@@ -1,8 +1,8 @@
 #include "starmelee.h"
 
 #define OBS_SIZE STARMELEE_OBS_SIZE
-#define NUM_ATNS 3
-#define ACT_SIZES {2, 2, 2}
+#define NUM_ATNS 4
+#define ACT_SIZES {2, 2, 2, 2}
 #define OBS_TENSOR_T FloatTensor
 
 #define Env StarMelee
@@ -86,6 +86,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->aim_reward = (float)dict_get(kwargs, "aim_reward")->value;
     env->strafe_reward = (float)dict_get(kwargs, "strafe_reward")->value;
     env->hit_reward = (float)dict_get(kwargs, "hit_reward")->value;
+    env->fire_nudge = (float)dict_get(kwargs, "fire_nudge")->value;
     env->cycle_reward = (float)dict_get(kwargs, "cycle_reward")->value;
     env->targeted_penalty = (float)dict_get(kwargs, "targeted_penalty")->value;
     env->shot_damage = (float)dict_get(kwargs, "shot_damage")->value;
@@ -95,6 +96,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->retreat_hp_frac = (float)dict_get(kwargs, "retreat_hp_frac")->value;
     env->hp_regen = (float)dict_get(kwargs, "hp_regen")->value;
     env->cannon_rounds = (int)dict_get(kwargs, "cannon_rounds")->value;
+    env->cannon_rounds_max = (int)dict_get(kwargs, "cannon_rounds_max")->value;
     env->cannon_interval_ticks = (int)dict_get(kwargs, "cannon_interval_ticks")->value;
     env->cannon_reload_ticks = (int)dict_get(kwargs, "cannon_reload_ticks")->value;
     env->projectile_speed = (float)dict_get(kwargs, "projectile_speed")->value;

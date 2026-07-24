@@ -17,7 +17,7 @@
 #define STARMELEE_OBS_ASTEROIDS 4  // rocks with their own stable obs slots
 #define STARMELEE_MAX_SHIPS 8
 #define STARMELEE_MAX_ASTEROIDS 8
-#define STARMELEE_MAX_PROJECTILES 32
+#define STARMELEE_MAX_PROJECTILES 64
 #define STARMELEE_TRAIL_LEN 48
 
 const unsigned char SM_STATE_APPROACH = 0;
@@ -100,10 +100,12 @@ typedef struct {
     unsigned char thrusting;
     unsigned char turning_left;
     unsigned char turning_right;
+    unsigned char firing;
     unsigned char last_result;
     int event_timer;  // render-only feedback countdown
     // combat mode
     unsigned char attack_state;  // APPROACH / FLEE / RETREAT
+    int mag_rounds;              // this spawn's magazine size (trait-like)
     int ammo;                    // rounds left in the magazine
     int cannon_timer;            // ticks until the next round (or reload end)
     unsigned char reloading;     // 1 while the 2 s reload runs (FLEE driver)
@@ -170,6 +172,7 @@ typedef struct {
     float aim_reward;        // per tracking tick inside the band
     float strafe_reward;     // per tick, scaled by transverse speed while tracking
     float hit_reward;        // landing a projectile on the enemy
+    float fire_nudge;        // +nudge per shot fired tracking-in-range, -nudge wild
     float cycle_reward;      // completing the disengage
     float targeted_penalty;  // charged to the ship a projectile hit
     float shot_damage;       // hp a projectile hit takes off the victim
@@ -180,8 +183,9 @@ typedef struct {
     float hp_regen;          // hp per tick while beyond disengage_range
 
     // cannon (combat mode)
-    int cannon_rounds;         // magazine size
-    int cannon_interval_ticks; // ticks between rounds within a burst
+    int cannon_rounds;         // magazine size (min when cannon_rounds_max set)
+    int cannon_rounds_max;     // per-spawn magazine sampled in [rounds, max]
+    int cannon_interval_ticks; // ticks between rounds within a salvo
     int cannon_reload_ticks;   // ticks to refill an empty magazine
     float projectile_speed;    // muzzle speed added along the heading
     float projectile_range;    // flight distance at muzzle speed before dissolving
@@ -298,6 +302,7 @@ void c_init(StarMelee* env) {
     if (env->aim_reward < 0.0f) env->aim_reward = 0.0f;
     if (env->strafe_reward < 0.0f) env->strafe_reward = 0.0f;
     if (env->hit_reward == 0.0f) env->hit_reward = 0.75f;
+    if (env->fire_nudge < 0.0f) env->fire_nudge = 0.0f;
     if (env->cycle_reward == 0.0f) env->cycle_reward = 0.5f;
     if (env->targeted_penalty < 0.0f) env->targeted_penalty = 0.0f;
     env->duel_spawn_frac = sm_clampf(env->duel_spawn_frac, 0.0f, 0.45f);
@@ -316,7 +321,11 @@ void c_init(StarMelee* env) {
     if (env->cannon_rounds < 1) env->cannon_rounds = 3;
     int rounds_cap = STARMELEE_MAX_PROJECTILES / STARMELEE_MAX_SHIPS;
     if (env->cannon_rounds > rounds_cap) env->cannon_rounds = rounds_cap;
-    if (env->cannon_interval_ticks < 1) env->cannon_interval_ticks = 30;
+    if (env->cannon_rounds_max < env->cannon_rounds) {
+        env->cannon_rounds_max = env->cannon_rounds;
+    }
+    if (env->cannon_rounds_max > rounds_cap) env->cannon_rounds_max = rounds_cap;
+    if (env->cannon_interval_ticks < 1) env->cannon_interval_ticks = 10;
     if (env->cannon_reload_ticks < 1) env->cannon_reload_ticks = 120;
     if (env->projectile_speed <= 0.0f) env->projectile_speed = 1.5f * env->max_speed;
     if (env->projectile_range <= 0.0f) env->projectile_range = 8.0f * env->ship_radius;
@@ -477,8 +486,14 @@ static void sm_spawn_ship(StarMelee* env, int i) {
     s->thrusting = 0;
     s->turning_left = 0;
     s->turning_right = 0;
+    s->firing = 0;
     s->attack_state = SM_STATE_APPROACH;
-    s->ammo = env->cannon_rounds;
+    // Magazine size is a per-spawn trait like thrust or fragility: sampled
+    // in [cannon_rounds, cannon_rounds_max], readable through the ammo obs
+    int mag_span = env->cannon_rounds_max - env->cannon_rounds + 1;
+    s->mag_rounds = env->cannon_rounds + (int)(sm_randf(env) * mag_span);
+    if (s->mag_rounds > env->cannon_rounds_max) s->mag_rounds = env->cannon_rounds_max;
+    s->ammo = s->mag_rounds;
     s->cannon_timer = 0;
     s->reloading = 0;
     s->cycle_paid = 0;
@@ -770,20 +785,24 @@ void compute_observations(StarMelee* env) {
                 obs[19] = sinf(aim_delta);
                 obs[20] = los ? 1.0f : 0.0f;
                 obs[21] = s->attack_state == SM_STATE_FLEE ? 1.0f : 0.0f;
-                obs[22] = (float)s->ammo / (float)env->cannon_rounds;
-                obs[23] = (float)o->ammo / (float)env->cannon_rounds;
+                // Normalized by the global max so absolute counts stay
+                // readable: a full 3-round magazine is 0.6, a full 5 is 1.0
+                obs[22] = (float)s->ammo / (float)env->cannon_rounds_max;
+                obs[23] = (float)o->ammo / (float)env->cannon_rounds_max;
                 obs[24] = cosf(o->heading);
                 obs[25] = sinf(o->heading);
-                obs[26] = s->reloading
-                    ? (float)s->cannon_timer / (float)env->cannon_reload_ticks : 0.0f;
+                // Cannon clock at reload scale: covers both the reload and
+                // the (much shorter) salvo cooldown, so the policy can see
+                // when its own trigger is live
+                obs[26] = (float)s->cannon_timer / (float)env->cannon_reload_ticks;
                 obs[32] = o->hp / env->hp_max;  // smell blood: press a wounded enemy
                 obs[34] = o->reloading ? 1.0f : 0.0f;  // their window of weakness
-                // Incoming fire imminent: the enemy is on duty with a
-                // chambered round, clear sight, weapon range, its nose on us
+                // Incoming fire imminent: the enemy has a chambered round,
+                // clear sight, weapon range, and its nose on us (free fire
+                // means any state can shoot)
                 float back = atan2f(-ody, -odx);
                 float e_err = fabsf(atan2f(sinf(o->heading - back), cosf(o->heading - back)));
-                obs[35] = (o->attack_state == SM_STATE_APPROACH && o->ammo > 0
-                    && los && odist <= env->projectile_range
+                obs[35] = (o->ammo > 0 && los && odist <= env->projectile_range
                     && e_err <= env->aim_cone) ? 1.0f : 0.0f;
                 // Enemy range at combat scale: the arena-scale deltas in
                 // obs[13..14] compress the whole engagement into < 0.09
@@ -959,7 +978,7 @@ static void sm_combat_tick(StarMelee* env, int i) {
     if (s->cannon_timer > 0) {
         s->cannon_timer -= 1;
         if (s->cannon_timer == 0 && s->reloading) {
-            s->ammo = env->cannon_rounds;
+            s->ammo = s->mag_rounds;
             s->reloading = 0;
             s->hits_this_mag = 0;
             if (s->attack_state == SM_STATE_FLEE) {
@@ -989,6 +1008,29 @@ static void sm_combat_tick(StarMelee* env, int i) {
     float aim_err = fabsf(atan2f(sinf(s->heading - bearing), cosf(s->heading - bearing)));
     int tracking = aim_err <= env->aim_cone
         && sm_los_clear(env, s->x, s->y, e->x, e->y);
+
+    // Free fire: the trigger is the 4th action button, live in any state
+    // with a chambered round off cooldown. A dumped magazine still costs
+    // the reload (forcing the flee leg when on duty) and pays no cycle
+    // unless it drew blood — that economy is the trigger discipline.
+    if (s->firing && s->ammo > 0 && s->cannon_timer == 0) {
+        sm_fire_projectile(env, i);
+        s->ammo -= 1;
+        // Nudge toward disciplined shots: firing with the nose on target
+        // inside weapon range pays a little, spraying costs the same
+        r += (tracking && dist <= env->projectile_range)
+            ? env->fire_nudge : -env->fire_nudge;
+        if (s->ammo > 0) {
+            s->cannon_timer = env->cannon_interval_ticks;
+        } else {
+            s->reloading = 1;
+            s->cannon_timer = env->cannon_reload_ticks;
+            s->cycle_paid = 0;
+            if (s->attack_state == SM_STATE_APPROACH) {
+                s->attack_state = SM_STATE_FLEE;
+            }
+        }
+    }
 
     if (s->attack_state == SM_STATE_APPROACH) {
         // Shaping toward the engagement band [attack_range_min, attack_range_max]
@@ -1080,15 +1122,16 @@ static void sm_combat_tick(StarMelee* env, int i) {
 static void sm_read_inputs(StarMelee* env) {
     for (int i = 0; i < env->num_ships; i++) {
         Ship* s = &env->ships[i];
-        int left = env->actions[i*3 + 0] > 0.5f;
-        int right = env->actions[i*3 + 1] > 0.5f;
-        int engine = env->actions[i*3 + 2] > 0.5f;
+        int left = env->actions[i*4 + 0] > 0.5f;
+        int right = env->actions[i*4 + 1] > 0.5f;
+        int engine = env->actions[i*4 + 2] > 0.5f;
+        int fire = env->actions[i*4 + 3] > 0.5f;
 
         // Jitter penalty: charge every button toggle so dithering (rapid
         // on/off switching a human would never produce) costs reward while
         // sustained holds stay free.
         int changes = (left != s->turning_left) + (right != s->turning_right)
-            + (engine != s->thrusting);
+            + (engine != s->thrusting) + (fire != s->firing);
         if (changes > 0 && env->input_change_penalty > 0.0f) {
             float jitter = env->input_change_penalty * (float)changes;
             env->rewards[i] -= jitter;
@@ -1098,6 +1141,7 @@ static void sm_read_inputs(StarMelee* env) {
         s->turning_left = (unsigned char)left;
         s->turning_right = (unsigned char)right;
         s->thrusting = (unsigned char)engine;
+        s->firing = (unsigned char)fire;
     }
 }
 
@@ -1594,7 +1638,7 @@ void c_render(StarMelee* env) {
             DrawRectangle(70, 130, (int)(100 * frac), 8, SM_YELLOW);
         } else {
             DrawText("ammo", 20, 128, 12, SM_WHITE);
-            for (int a = 0; a < env->cannon_rounds; a++) {
+            for (int a = 0; a < s0->mag_rounds; a++) {
                 Color pip = a < s0->ammo ? SM_GREEN : Fade(SM_WHITE, 0.2f);
                 DrawRectangle(70 + 14 * a, 130, 10, 8, pip);
             }

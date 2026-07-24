@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 MAGIC = 0x31504D53  # 'SMP1'
-NVEC = (2, 2, 2)
+NVEC = (2, 2, 2, 2)  # left, right, engine, fire
 
 
 def main():

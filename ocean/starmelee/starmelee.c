@@ -1,7 +1,7 @@
 // Standalone StarMelee: manual play-test and trained-policy playback.
 //
-// Controls: LEFT/A and RIGHT/D turn, UP/W/SPACE fires the engine, R respawns,
-// C toggles the follow camera, Z/X zoom, ESC quits. If
+// Controls: LEFT/A and RIGHT/D turn, UP/W thrusts, SPACE/LCTRL fires the
+// cannon, R respawns, C toggles the follow camera, Z/X zoom, ESC quits. If
 // resources/starmelee/starmelee_policy.bin exists (produced by
 // ocean/starmelee/export_policy.py from a torch checkpoint), the policy
 // flies every ship; holding LEFT SHIFT hands ship 0 to the keyboard, so the
@@ -74,7 +74,7 @@ static SMPolicy* smp_load(const char* path, int num_agents) {
     int ok = net->obs_size == STARMELEE_OBS_SIZE
         && net->hidden > 0 && net->hidden <= 4096
         && net->num_layers > 0 && net->num_layers <= 8
-        && net->num_heads == 3
+        && net->num_heads == 4
         && fread(net->nvec, sizeof(int), net->num_heads, file) == (size_t)net->num_heads;
     for (int hd = 0; ok && hd < net->num_heads; hd++) {
         net->logit_sum += net->nvec[hd];
@@ -256,6 +256,7 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "aim_reward") == 0) env->aim_reward = value;
         else if (strcmp(key, "strafe_reward") == 0) env->strafe_reward = value;
         else if (strcmp(key, "hit_reward") == 0) env->hit_reward = value;
+        else if (strcmp(key, "fire_nudge") == 0) env->fire_nudge = value;
         else if (strcmp(key, "cycle_reward") == 0) env->cycle_reward = value;
         else if (strcmp(key, "targeted_penalty") == 0) env->targeted_penalty = value;
         else if (strcmp(key, "shot_damage") == 0) env->shot_damage = value;
@@ -263,6 +264,7 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "trait_variation") == 0) env->trait_variation = value;
         else if (strcmp(key, "loiter_reward") == 0) env->loiter_reward = value;
         else if (strcmp(key, "cannon_rounds") == 0) env->cannon_rounds = (int)value;
+        else if (strcmp(key, "cannon_rounds_max") == 0) env->cannon_rounds_max = (int)value;
         else if (strcmp(key, "cannon_interval_ticks") == 0) env->cannon_interval_ticks = (int)value;
         else if (strcmp(key, "cannon_reload_ticks") == 0) env->cannon_reload_ticks = (int)value;
         else if (strcmp(key, "projectile_speed") == 0) env->projectile_speed = value;
@@ -300,7 +302,7 @@ int main(int argc, char** argv) {
 
     int num_agents = env.num_agents;
     env.observations = (float*)calloc(num_agents * STARMELEE_OBS_SIZE, sizeof(float));
-    env.actions = (float*)calloc(num_agents * 3, sizeof(float));
+    env.actions = (float*)calloc(num_agents * 4, sizeof(float));
     env.rewards = (float*)calloc(num_agents, sizeof(float));
     env.terminals = (float*)calloc(num_agents, sizeof(float));
 
@@ -328,18 +330,19 @@ int main(int argc, char** argv) {
             if (i == 0 && manual0) {
                 env.actions[0] = (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) ? 1.0f : 0.0f;
                 env.actions[1] = (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) ? 1.0f : 0.0f;
-                env.actions[2] = (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W) || IsKeyDown(KEY_SPACE))
+                env.actions[2] = (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) ? 1.0f : 0.0f;
+                env.actions[3] = (IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_LEFT_CONTROL))
                     ? 1.0f : 0.0f;
             } else if (net != NULL) {
                 // Trained cadence: decide every policy_repeat frames, latch between
                 if (policy_turn) {
                     smp_forward(net, &env.observations[i * STARMELEE_OBS_SIZE], i,
-                        &env.actions[i * 3], &policy_rng);
+                        &env.actions[i * 4], &policy_rng);
                 }
             } else {
-                env.actions[i * 3 + 0] = 0.0f;
-                env.actions[i * 3 + 1] = 0.0f;
-                env.actions[i * 3 + 2] = 0.0f;
+                for (int a = 0; a < 4; a++) {
+                    env.actions[i * 4 + a] = 0.0f;
+                }
             }
         }
 
