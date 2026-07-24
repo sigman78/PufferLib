@@ -231,6 +231,14 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     log_dir = os.path.join(args['log_dir'], args['env_name'])
     os.makedirs(log_dir, exist_ok=True)
 
+    # Declared frozen banks are only ever loaded by selfplay.setup; with the
+    # pool disabled they would drive their agent rows with uninitialized
+    # weights. Drop them before creation so --selfplay.enabled 0 behaves
+    # like no banks at all.
+    if not args.get('selfplay', {}).get('enabled', 0):
+        args['vec']['num_frozen_banks'] = 0
+        args['vec']['frozen_bank_pct'] = 0.0
+
     try:
         pufferl = backend.create_pufferl(args)
     except RuntimeError as e:
@@ -240,6 +248,21 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         return
 
     args.pop('nccl_id', None)
+
+    load_path = args.get('load_model_path')
+    if load_path and backend is _C:
+        if load_path == 'latest':
+            pattern = os.path.join(args['checkpoint_dir'], args['env_name'], '**', '*.bin')
+            candidates = glob.glob(pattern, recursive=True)
+            candidates = [c for c in candidates if os.path.basename(os.path.dirname(c)) != 'pool']
+            if not candidates:
+                raise FileNotFoundError(f'No .bin checkpoints found in {args["checkpoint_dir"]}/{args["env_name"]}/')
+            load_path = max(candidates, key=os.path.getctime)
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f'load_model_path does not exist: {load_path}')
+        backend.load_weights(pufferl, load_path)
+        print(f'Loaded weights from {load_path}')
+
     model_size = pufferl.num_params()
     if verbose:
         flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))
@@ -491,6 +514,11 @@ def eval(env_name, args=None, load_path=None):
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
+    # Frozen banks are a training-time construct: nothing loads them in eval,
+    # and declared-but-unloaded banks would drive their agent rows with
+    # uninitialized weights. match() sets its own bank config after this.
+    args['vec']['num_frozen_banks'] = 0
+    args['vec']['frozen_bank_pct'] = 0.0
 
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
@@ -501,6 +529,7 @@ def eval(env_name, args=None, load_path=None):
         checkpoint_dir = args['checkpoint_dir']
         pattern = os.path.join(checkpoint_dir, args['env_name'], '**', '*.bin')
         candidates = glob.glob(pattern, recursive=True)
+        candidates = [c for c in candidates if os.path.basename(os.path.dirname(c)) != 'pool']
         if not candidates:
             raise FileNotFoundError(f'No .bin checkpoints found in {checkpoint_dir}/{args["env_name"]}/')
         load_path = max(candidates, key=os.path.getctime)
@@ -538,6 +567,7 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
             return path
         pattern = os.path.join(args['checkpoint_dir'], args['env_name'], '**', '*.bin')
         candidates = glob.glob(pattern, recursive=True)
+        candidates = [c for c in candidates if os.path.basename(os.path.dirname(c)) != 'pool']
         if not candidates:
             raise FileNotFoundError(f'No .bin checkpoints found in {args["checkpoint_dir"]}/{args["env_name"]}/')
         return max(candidates, key=os.path.getctime)
