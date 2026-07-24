@@ -181,6 +181,10 @@ typedef struct {
     float loiter_reward;     // per tick spent beyond disengage_range while off duty
     float retreat_hp_frac;   // hp fraction that forces RETREAT; 0 disables
     float hp_regen;          // hp per tick while beyond disengage_range
+    float close_range;       // keep-out bubble around the enemy, world units
+    float too_close_penalty; // per tick inside the bubble, scaled by depth
+    float avoid_range;       // collision-course deterrent active inside this
+    float collision_course_penalty; // per tick on a course through the bubble
 
     // cannon (combat mode)
     int cannon_rounds;         // magazine size (min when cannon_rounds_max set)
@@ -331,6 +335,14 @@ void c_init(StarMelee* env) {
     if (env->projectile_range <= 0.0f) env->projectile_range = 8.0f * env->ship_radius;
     // Shots must be able to cross the engagement band they are fired in
     env->projectile_range = fmaxf(env->projectile_range, env->attack_range_max);
+
+    // Spacing: keep-out bubble below the band, deterrent horizon above it
+    if (env->close_range <= 0.0f) env->close_range = 4.0f * env->ship_radius;
+    env->close_range = fminf(env->close_range, env->attack_range_min);
+    if (env->too_close_penalty < 0.0f) env->too_close_penalty = 0.0f;
+    if (env->avoid_range <= 0.0f) env->avoid_range = 12.0f * env->ship_radius;
+    env->avoid_range = fmaxf(env->avoid_range, env->close_range);
+    if (env->collision_course_penalty < 0.0f) env->collision_course_penalty = 0.0f;
 
     if (env->num_asteroids < 0) env->num_asteroids = 0;
     // Every rock must own an obs slot: an unobservable lethal hazard is
@@ -1028,6 +1040,28 @@ static void sm_combat_tick(StarMelee* env, int i) {
             s->cycle_paid = 0;
             if (s->attack_state == SM_STATE_APPROACH) {
                 s->attack_state = SM_STATE_FLEE;
+            }
+        }
+    }
+
+    // Spacing discipline, active in every state. Inside close_range the
+    // keep-out penalty grows with intrusion depth; out to avoid_range a
+    // relative velocity whose projected pass would enter the keep-out
+    // bubble is a collision course and pays by closing speed — oblique
+    // passes and orbits are free, rams are not.
+    if (dist < env->close_range) {
+        r -= env->too_close_penalty * (env->close_range - dist) / env->close_range;
+    } else if (dist < env->avoid_range && env->collision_course_penalty > 0.0f) {
+        float rvx = s->vx - e->vx;
+        float rvy = s->vy - e->vy;
+        float along = rvx * dx + rvy * dy;  // > 0 when closing
+        if (along > 0.0f) {
+            float v2 = rvx * rvx + rvy * rvy;
+            float miss_sq = dist * dist - along * along / fmaxf(v2, 1e-6f);
+            if (miss_sq < env->close_range * env->close_range) {
+                float closing = along / fmaxf(dist, 1e-5f);
+                r -= env->collision_course_penalty
+                    * sm_clampf(closing / (2.0f * env->max_speed), 0.0f, 1.0f);
             }
         }
     }

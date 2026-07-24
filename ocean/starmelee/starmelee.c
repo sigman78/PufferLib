@@ -271,6 +271,10 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "projectile_range") == 0) env->projectile_range = value;
         else if (strcmp(key, "retreat_hp_frac") == 0) env->retreat_hp_frac = value;
         else if (strcmp(key, "hp_regen") == 0) env->hp_regen = value;
+        else if (strcmp(key, "close_range") == 0) env->close_range = value;
+        else if (strcmp(key, "too_close_penalty") == 0) env->too_close_penalty = value;
+        else if (strcmp(key, "avoid_range") == 0) env->avoid_range = value;
+        else if (strcmp(key, "collision_course_penalty") == 0) env->collision_course_penalty = value;
         else if (strcmp(key, "num_asteroids") == 0) env->num_asteroids = (int)value;
         else if (strcmp(key, "asteroid_radius") == 0) env->asteroid_radius = value;
         else if (strcmp(key, "asteroid_damage") == 0) env->asteroid_damage = value;

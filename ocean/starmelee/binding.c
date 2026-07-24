@@ -95,6 +95,10 @@ void my_init(Env* env, Dict* kwargs) {
     env->loiter_reward = (float)dict_get(kwargs, "loiter_reward")->value;
     env->retreat_hp_frac = (float)dict_get(kwargs, "retreat_hp_frac")->value;
     env->hp_regen = (float)dict_get(kwargs, "hp_regen")->value;
+    env->close_range = (float)dict_get(kwargs, "close_range")->value;
+    env->too_close_penalty = (float)dict_get(kwargs, "too_close_penalty")->value;
+    env->avoid_range = (float)dict_get(kwargs, "avoid_range")->value;
+    env->collision_course_penalty = (float)dict_get(kwargs, "collision_course_penalty")->value;
     env->cannon_rounds = (int)dict_get(kwargs, "cannon_rounds")->value;
     env->cannon_rounds_max = (int)dict_get(kwargs, "cannon_rounds_max")->value;
     env->cannon_interval_ticks = (int)dict_get(kwargs, "cannon_interval_ticks")->value;
