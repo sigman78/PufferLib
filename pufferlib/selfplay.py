@@ -24,10 +24,30 @@ import numpy as np
 from pufferlib import _C
 
 
-def sample_opponent(pool, rng):
-    candidates = pool if len(pool) < 6 else pool[:-5]
-    weights = np.array([(i + 1) ** 0.5 for i in range(len(candidates))], dtype=np.float64)
-    weights /= weights.sum()
+def pfsp_weights(elos, primary_elo, p):
+    '''Prioritized fictitious self-play weights from Elo-implied win odds.
+    x = P(primary beats entry); weight = (1 - x)^p, so opponents the primary
+    cannot yet beat dominate the draw. A small floor keeps every entry alive
+    (Elo is noisy early and stale entries deserve occasional re-measurement).'''
+    x = 1.0 / (1.0 + 10.0 ** ((np.asarray(elos, dtype=np.float64) - primary_elo) / 400.0))
+    w = (1.0 - x) ** p + 1e-3
+    return w / w.sum()
+
+
+def sample_opponent(pool, rng, primary_elo=None, pfsp_p=0.0, exclude_newest=5):
+    '''pfsp_p > 0: PFSP hardness sampling on the pool's Elo estimates.
+    pfsp_p == 0: legacy recency-biased sqrt-index weighting. Either way the
+    newest entries are excluded (near-copies of the primary — mirror play is
+    already covered by the pure-selfplay envs).'''
+    if exclude_newest > 0 and len(pool) > exclude_newest:
+        candidates = pool[:-exclude_newest]
+    else:
+        candidates = pool
+    if pfsp_p > 0.0 and primary_elo is not None:
+        weights = pfsp_weights([c['elo'] for c in candidates], primary_elo, pfsp_p)
+    else:
+        weights = np.array([(i + 1) ** 0.5 for i in range(len(candidates))], dtype=np.float64)
+        weights /= weights.sum()
     idx = int(rng.choice(len(candidates), p=weights))
     return candidates[idx]
 
@@ -151,6 +171,15 @@ def setup(pufferl, backend, args, run_id):
     # frozen_bank_pct is per-bank (matches C-side: pufferlib.cu:2069). Each bank
     # gets floor(apb * pct) agents, total historical = num_banks * frozen_size.
     frozen_size = int(agents_per_buffer * float(args['vec']['frozen_bank_pct']))
+    if frozen_size % team_size != 0:
+        # The C bank_layout uses the UNALIGNED floor(apb * pct); if team-size
+        # alignment would change the slice here, Python routing and the C
+        # forward-pass banks disagree and primary rows get driven by frozen
+        # weights. Refuse instead of silently corrupting attribution.
+        raise RuntimeError(
+            f'frozen_bank_pct slice ({frozen_size}) is not a multiple of '
+            f'team_size ({team_size}); pick a pct whose floor(apb * pct) '
+            f'aligns, or the C-side bank layout will diverge from the perm')
     frozen_size -= frozen_size % team_size
     if frozen_size <= 0:
         raise RuntimeError('selfplay.enabled but frozen_bank_pct rounds to 0 slots '
@@ -166,13 +195,32 @@ def setup(pufferl, backend, args, run_id):
     backend.set_agent_perm(pufferl, perm)
     backend.set_env_tags(pufferl, tags)
 
+    # Fixed exploiter banks: the LAST len(fixed_paths) banks are pinned to
+    # externally trained checkpoints (e.g. a dense-reward brawler) and never
+    # rotate through the pool. League guardrails: a homogeneous self-play
+    # population can drift into a degenerate meta together; exploiters with
+    # different reward DNA keep the competition sharp.
+    fixed_paths = [p.strip() for p in
+        str(sp.get('fixed_bank_paths', '')).split(',') if p.strip()]
+    if len(fixed_paths) > num_banks:
+        raise RuntimeError(f'{len(fixed_paths)} fixed_bank_paths exceed '
+                           f'num_frozen_banks ({num_banks})')
+    for p in fixed_paths:
+        if not os.path.exists(p):
+            raise RuntimeError(f'fixed_bank_paths entry does not exist: {p}')
+    first_fixed = num_banks - len(fixed_paths)
+
     pool_dir = os.path.join(args['checkpoint_dir'], args['env_name'], run_id, 'pool')
     os.makedirs(pool_dir, exist_ok=True)
     bootstrap_path = os.path.join(pool_dir, f'{pufferl.global_step:016d}.bin')
     backend.save_weights(pufferl, bootstrap_path)
-    # Load bootstrap into every bank — they'll diverge as each bank's swap fires.
+    # Rotating banks start from the bootstrap — they'll diverge as each
+    # bank's swap fires. Fixed banks load their pinned checkpoints.
     for b in range(num_banks):
-        backend.load_frozen_bank(pufferl, b, bootstrap_path)
+        if b >= first_fixed:
+            backend.load_frozen_bank(pufferl, b, fixed_paths[b - first_fixed])
+        else:
+            backend.load_frozen_bank(pufferl, b, bootstrap_path)
 
     elo_init = float(sp.get('elo_init', 0.0))
     elo_k    = float(sp.get('elo_k',    16.0))
@@ -181,7 +229,9 @@ def setup(pufferl, backend, args, run_id):
     banks_state = []
     for b in range(num_banks):
         banks_state.append({
-            'cur_opp_path': bootstrap_path,
+            'fixed': b >= first_fixed,
+            'cur_opp_path': fixed_paths[b - first_fixed] if b >= first_fixed
+                            else bootstrap_path,
             'cur_opp_elo': elo_init,
             'hist_score': 0.0,
             'hist_n': 0.0,
@@ -203,6 +253,8 @@ def setup(pufferl, backend, args, run_id):
         'swap_winrate': float(sp['swap_winrate']),
         'snapshot_interval': int(sp.get('snapshot_interval', 1_000_000_000)),
         'opp_timeout_steps': int(sp.get('opp_timeout_steps', 500_000_000)),
+        'pfsp_p': float(sp.get('pfsp_p', 0.0)),
+        'pfsp_exclude_newest': int(sp.get('pfsp_exclude_newest', 5)),
         'num_banks': num_banks,
         'banks': banks_state,
         'primary_elo': elo_init,
@@ -251,9 +303,13 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
         pool_state['last_snapshot_step'] = int(pufferl.global_step)
 
     # 3. Per-bank swap logic. Each bank decides independently based on its own
-    # winrate. Tags 1..num_banks correspond to bank 0..num_banks-1.
+    # winrate. Tags 1..num_banks correspond to bank 0..num_banks-1. Fixed
+    # exploiter banks never swap — their Elo/winrate above still updates, as
+    # the running readout of how the primary fares against the guardrail.
     for b in range(num_banks):
         bank = pool_state['banks'][b]
+        if bank.get('fixed'):
+            continue
         winrate = (bank['hist_score'] / bank['hist_n']
                        if bank['hist_n'] > 0 else None)
         winrate_met = (winrate is not None
@@ -287,7 +343,10 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
                 pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
                 pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
                 pool_state['last_snapshot_step'] = int(pufferl.global_step)
-            opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'])
+            opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'],
+                primary_elo=pool_state['primary_elo'],
+                pfsp_p=pool_state['pfsp_p'],
+                exclude_newest=pool_state['pfsp_exclude_newest'])
             bank['pending_opp_path'] = opp_entry['path']
             bank['pending_opp_elo'] = opp_entry['elo']
             bank['epoch_armed'] = epoch
