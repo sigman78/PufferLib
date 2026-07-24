@@ -282,6 +282,11 @@ static int sm_load_ini(StarMelee* env, const char* path) {
         else if (strcmp(key, "asteroid_speed_max") == 0) env->asteroid_speed_max = value;
         else if (strcmp(key, "asteroid_respawn_ticks") == 0) env->asteroid_respawn_ticks = (int)value;
         else if (strcmp(key, "danger_hp_weight") == 0) env->danger_hp_weight = value;
+        else if (strcmp(key, "sparse_reward") == 0) env->sparse_reward = (int)value;
+        else if (strcmp(key, "sparse_kill_reward") == 0) env->sparse_kill_reward = value;
+        else if (strcmp(key, "sparse_damage_scale") == 0) env->sparse_damage_scale = value;
+        else if (strcmp(key, "sparse_damage_taken_scale") == 0) env->sparse_damage_taken_scale = value;
+        else if (strcmp(key, "sparse_timeout_penalty") == 0) env->sparse_timeout_penalty = value;
     }
     fclose(f);
     return 1;
@@ -309,6 +314,15 @@ int main(int argc, char** argv) {
     env.actions = (float*)calloc(num_agents * 4, sizeof(float));
     env.rewards = (float*)calloc(num_agents, sizeof(float));
     env.terminals = (float*)calloc(num_agents, sizeof(float));
+
+    // Standalone (non-vecenv) path: wire per-slot pointers to adjacent rows of
+    // the env-owned buffers. vecenv path overrides these via my_setup_perm.
+    for (int s = 0; s < env.num_ships; s++) {
+        env.obs_ptr[s]      = env.observations + s * STARMELEE_OBS_SIZE;
+        env.action_ptr[s]   = env.actions + s * 4;
+        env.reward_ptr[s]   = env.rewards + s;
+        env.terminal_ptr[s] = env.terminals + s;
+    }
 
     // Optional trained policy, exported by ocean/starmelee/export_policy.py
     const char* policy_path = "resources/starmelee/starmelee_policy.bin";

@@ -16,6 +16,7 @@
 #define STARMELEE_OBS_SIZE 62
 #define STARMELEE_OBS_ASTEROIDS 4  // rocks with their own stable obs slots
 #define STARMELEE_MAX_SHIPS 8
+#define STARMELEE_MAX_BANKS 8      // frozen selfplay-pool opponent banks
 #define STARMELEE_MAX_ASTEROIDS 8
 #define STARMELEE_MAX_PROJECTILES 64
 #define STARMELEE_TRAIL_LEN 48
@@ -46,6 +47,17 @@ typedef struct {
     float retreats;       // combat: times low hp forced a retreat
     float asteroid_hits;  // asteroid impacts taken
     float asteroid_kills; // rocks broken by this ship's cannon fire
+    float contact_frac;   // fraction of the episode spent within disengage_range
+    // Selfplay-pool duel accounting. hist_score_bank[b] sums slot 0's round
+    // score (1 win / 0.5 draw / 0 loss) on envs tagged b+1; hist_n_bank[b]
+    // counts those rounds. hist_score / hist_n aggregate across banks for
+    // legacy dashboards. slot_0/1_score feed match() head-to-head readouts.
+    float hist_score;
+    float hist_n;
+    float hist_score_bank[STARMELEE_MAX_BANKS];
+    float hist_n_bank[STARMELEE_MAX_BANKS];
+    float slot_0_score;
+    float slot_1_score;
     float n;
 } Log;
 
@@ -112,6 +124,7 @@ typedef struct {
     unsigned char cycle_paid;    // this FLEE already resolved its cycle
     int hits_this_mag;           // hits landed by the current magazine
     int attack_passes;           // projectile hits landed
+    int ticks_in_contact;        // ticks spent within disengage_range of the enemy
     int shots_fired;
     int asteroid_kills;
     int full_cycles;
@@ -135,7 +148,22 @@ typedef struct {
     float* actions;
     float* rewards;
     float* terminals;
+    // Per-slot pointers populated by my_setup_perm (MY_USES_PERM): the
+    // selfplay agent_perm reroutes logical ship slots into specific physical
+    // rows (primary vs frozen-bank). The standalone wires these to the
+    // adjacent env-owned rows, so all sim code goes through them.
+    float* obs_ptr[STARMELEE_MAX_SHIPS];
+    float* action_ptr[STARMELEE_MAX_SHIPS];
+    float* reward_ptr[STARMELEE_MAX_SHIPS];
+    float* terminal_ptr[STARMELEE_MAX_SHIPS];
     int num_agents;
+
+    // Selfplay-pool tagging (MY_USES_TAGS). tag = 0: pure selfplay env.
+    // tag = 1..STARMELEE_MAX_BANKS: ship 0 = primary, ship 1 = frozen
+    // opponent from bank (tag - 1). boundary_reached flips on episode end so
+    // Python can align frozen-bank swaps to round boundaries.
+    int tag;
+    int boundary_reached;
 
     // config
     float size;            // torus side length in world units
@@ -202,6 +230,19 @@ typedef struct {
     float asteroid_speed_max;    // clamped to max_speed / 2
     int asteroid_respawn_ticks;  // delay before a destroyed rock returns
     float danger_hp_weight;      // hazard pain grows this much as hp empties
+
+    // Sparse-reward mode: only kills, damage dealt, and damage taken pay.
+    // All dense shaping (band/aim/strafe/cycle/spacing/nudges/penalties) is
+    // forced to zero in c_init and the cannon fires only on the policy's
+    // trigger — behavior must emerge from the win/damage economy alone.
+    int sparse_reward;
+    float sparse_kill_reward;    // paid to the shooter for a killing blow
+    float sparse_damage_scale;   // shooter's reward per (damage / hp_max) dealt
+    float sparse_damage_taken_scale; // victim's penalty per (damage / hp_max),
+                                 // also hazard pain; below the dealt scale it
+                                 // tilts the economy toward aggression
+    float sparse_timeout_penalty; // cowardice tax at the buzzer, scaled by
+                                 // the fraction of the round out of contact
 
     Ship ships[STARMELEE_MAX_SHIPS];
     Asteroid asteroids[STARMELEE_MAX_ASTEROIDS];
@@ -362,6 +403,29 @@ void c_init(StarMelee* env) {
     }
     if (env->asteroid_respawn_ticks < 1) env->asteroid_respawn_ticks = 300;
     env->danger_hp_weight = sm_clampf(env->danger_hp_weight, 0.0f, 3.0f);
+
+    // Sparse mode: zero every shaping coefficient AFTER the re-defaulting
+    // above, so a bare sparse_reward=1 cannot resurrect dense terms through
+    // the zero-fallbacks. Mechanics (reload cycle, retreat, regen, physics)
+    // are untouched — the states become bookkeeping, not reward scaffolding.
+    // input_change_penalty deliberately SURVIVES sparse: it prices control
+    // style (human-cadence hands vs button dithering), not the task.
+    if (env->sparse_reward) {
+        env->step_penalty = 0.0f;
+        env->progress_scale = 0.0f;
+        env->engage_scale = 0.0f;
+        env->aim_reward = 0.0f;
+        env->strafe_reward = 0.0f;
+        env->fire_nudge = 0.0f;
+        env->cycle_reward = 0.0f;
+        env->loiter_reward = 0.0f;
+        env->too_close_penalty = 0.0f;
+        env->collision_course_penalty = 0.0f;
+        if (env->sparse_kill_reward < 0.0f) env->sparse_kill_reward = 0.0f;
+        if (env->sparse_damage_scale < 0.0f) env->sparse_damage_scale = 0.0f;
+        if (env->sparse_damage_taken_scale < 0.0f) env->sparse_damage_taken_scale = 0.0f;
+        if (env->sparse_timeout_penalty < 0.0f) env->sparse_timeout_penalty = 0.0f;
+    }
 }
 
 // Hazard pain multiplier: the same hp loss should hurt more when hp is low,
@@ -511,6 +575,7 @@ static void sm_spawn_ship(StarMelee* env, int i) {
     s->cycle_paid = 0;
     s->hits_this_mag = 0;
     s->attack_passes = 0;
+    s->ticks_in_contact = 0;
     s->shots_fired = 0;
     s->asteroid_kills = 0;
     s->full_cycles = 0;
@@ -618,7 +683,7 @@ static void sm_asteroids_tick(StarMelee* env) {
 
         for (int i = 0; i < env->num_ships; i++) {
             Ship* s = &env->ships[i];
-            if (s->just_finished) continue;
+            if (s->just_finished || s->hp <= 0.0f) continue;
             if (sm_torus_dist(env, a->x, a->y, s->x, s->y)
                     >= a->radius + env->ship_radius) {
                 continue;
@@ -629,8 +694,9 @@ static void sm_asteroids_tick(StarMelee* env) {
             s->vx += 0.3f * a->vx;
             s->vy += 0.3f * a->vy;
             float pain = -fminf(damage, 0.6f * env->hp_max) / env->hp_max
-                * sm_pain_scale(env, s);
-            env->rewards[i] += pain;
+                * (env->sparse_reward ? env->sparse_damage_taken_scale
+                                      : sm_pain_scale(env, s));
+            *env->reward_ptr[i] += pain;
             s->episode_return += pain;
             sm_destroy_asteroid(env, k);
             break;
@@ -717,19 +783,45 @@ static void sm_projectiles_tick(StarMelee* env) {
         for (int i = 0; i < env->num_ships; i++) {
             if (i == p->owner) continue;
             Ship* s = &env->ships[i];
-            if (s->just_finished) continue;
+            // hp <= 0 covers a ship killed earlier this same physics tick
+            // (just_finished is only set in the task block): no rewards,
+            // credits, or kill bonuses may be farmed off a corpse.
+            if (s->just_finished || s->hp <= 0.0f) continue;
             if (!sm_sweep_hits(env, from_x, from_y, p->vx, p->vy, s->x, s->y,
                     env->ship_radius)) {
                 continue;
             }
-            s->hp -= env->shot_damage * s->t_fragility;
+            float damage = env->shot_damage * s->t_fragility;
+            s->hp -= damage;
             s->hit_flash = 12;
-            float sting = env->targeted_penalty * s->t_caution;
-            env->rewards[i] -= sting;
-            s->episode_return -= sting;
             Ship* owner = &env->ships[p->owner];
-            env->rewards[p->owner] += env->hit_reward;
-            owner->episode_return += env->hit_reward;
+            if (env->sparse_reward) {
+                // Damage economy: the shooter earns the dealt scale, the
+                // victim pays the taken scale, both as fractions of a full
+                // hp bar. Taken below dealt makes exchanges positive-sum
+                // for the pair — the counter to a defensive-avoidance meta
+                // is that fighting back beats running.
+                float dmg_frac = fminf(damage, 0.6f * env->hp_max) / env->hp_max;
+                float taken = dmg_frac * env->sparse_damage_taken_scale;
+                float dealt = dmg_frac * env->sparse_damage_scale;
+                *env->reward_ptr[i] -= taken;
+                s->episode_return -= taken;
+                *env->reward_ptr[p->owner] += dealt;
+                owner->episode_return += dealt;
+                // The kill is the win signal, credited only for the killing
+                // blow: a self-inflicted planet or asteroid death stays the
+                // victim's loss alone and pays no one.
+                if (s->hp <= 0.0f) {
+                    *env->reward_ptr[p->owner] += env->sparse_kill_reward;
+                    owner->episode_return += env->sparse_kill_reward;
+                }
+            } else {
+                float sting = env->targeted_penalty * s->t_caution;
+                *env->reward_ptr[i] -= sting;
+                s->episode_return -= sting;
+                *env->reward_ptr[p->owner] += env->hit_reward;
+                owner->episode_return += env->hit_reward;
+            }
             owner->attack_passes += 1;
             owner->hits_this_mag += 1;
             p->life = 0;
@@ -743,7 +835,7 @@ void compute_observations(StarMelee* env) {
     float half_diag = 0.70711f * env->size;
     for (int i = 0; i < env->num_ships; i++) {
         Ship* s = &env->ships[i];
-        float* obs = &env->observations[i * STARMELEE_OBS_SIZE];
+        float* obs = env->obs_ptr[i];
 
         float gdx = sm_wrap_delta(s->goal_x - s->x, env->size);
         float gdy = sm_wrap_delta(s->goal_y - s->y, env->size);
@@ -915,19 +1007,48 @@ static void sm_add_log(StarMelee* env, Ship* s, unsigned char result) {
     env->log.retreats += (float)s->retreats;
     env->log.asteroid_hits += (float)s->asteroid_hits;
     env->log.asteroid_kills += (float)s->asteroid_kills;
+    env->log.contact_frac += s->episode_tick > 0
+        ? (float)s->ticks_in_contact / (float)s->episode_tick : 0.0f;
     env->log.input_changes += s->episode_tick > 0
         ? (float)s->input_changes / (float)s->episode_tick : 0.0f;
     env->log.n += 1.0f;
 }
 
+// One duel round result: s0_score is 1.0 when slot 0's side won the round,
+// 0.5 for a draw, 0.0 for a loss. Feeds match() (slot scores) and, on tagged
+// envs, the selfplay pool's per-bank winrate that drives opponent swaps.
+static void sm_record_game(StarMelee* env, float s0_score) {
+    env->log.slot_0_score += s0_score;
+    env->log.slot_1_score += 1.0f - s0_score;
+    if (env->tag > 0 && env->tag <= STARMELEE_MAX_BANKS) {
+        int bank_idx = env->tag - 1;
+        env->log.hist_score_bank[bank_idx] += s0_score;
+        env->log.hist_n_bank[bank_idx] += 1.0f;
+        env->log.hist_score += s0_score;
+        env->log.hist_n += 1.0f;
+    }
+}
+
 // Ends ship i's episode: terminal reward, log, respawn in place.
 static void sm_finish_ship(StarMelee* env, int i, float reward, unsigned char result) {
     Ship* s = &env->ships[i];
-    env->rewards[i] += reward;
+    *env->reward_ptr[i] += reward;
     s->episode_return += reward;
-    env->terminals[i] = 1.0f;
+    *env->terminal_ptr[i] = 1.0f;
     s->last_result = result;
     sm_add_log(env, s, result);
+    // Round scoring: a death decides the round for the survivor however it
+    // happened (shot, planet, rock — elimination is elimination). Only slot
+    // 0's timeout counts the draw so the pair doesn't log it twice. Every
+    // episode end is a swap-safe boundary for the frozen-bank curriculum.
+    if (env->combat && env->num_ships == 2) {
+        if (result == SM_RESULT_CRASH) {
+            sm_record_game(env, i == 1 ? 1.0f : 0.0f);
+        } else if (result == SM_RESULT_TIMEOUT && i == 0) {
+            sm_record_game(env, 0.5f);
+        }
+    }
+    env->boundary_reached = 1;
     sm_spawn_ship(env, i);
     env->ships[i].just_finished = 1;
     // All in-flight rounds die with the episode: the finisher's own shots
@@ -985,6 +1106,11 @@ static void sm_combat_tick(StarMelee* env, int i) {
     float dist = sqrtf(dx*dx + dy*dy);
     float r = env->step_penalty;  // duels feel time pressure too
     float next_prev = dist;       // next tick's shaping baseline
+
+    // Participation clock for the sparse cowardice tax: time spent inside
+    // the disengage envelope counts as being in the fight, whatever state
+    // the ship is in.
+    if (dist <= env->disengage_range) s->ticks_in_contact += 1;
 
     // Cannon clock runs in every state; a finished reload releases FLEE
     if (s->cannon_timer > 0) {
@@ -1086,8 +1212,10 @@ static void sm_combat_tick(StarMelee* env, int i) {
             r += env->strafe_reward * sm_clampf(v_perp / env->max_speed, 0.0f, 1.0f);
         }
 
-        // Fire only when tracking the opponent inside weapon range
-        if (tracking && dist <= env->projectile_range
+        // Fire only when tracking the opponent inside weapon range. Sparse
+        // mode drops this assist entirely: the trigger belongs to the
+        // policy's fire button alone, ambushes and held fire included.
+        if (!env->sparse_reward && tracking && dist <= env->projectile_range
                 && s->ammo > 0 && s->cannon_timer == 0) {
             sm_fire_projectile(env, i);
             s->ammo -= 1;
@@ -1147,7 +1275,7 @@ static void sm_combat_tick(StarMelee* env, int i) {
     }
 
     s->prev_enemy_dist = next_prev;
-    env->rewards[i] += r;
+    *env->reward_ptr[i] += r;
     s->episode_return += r;
 }
 
@@ -1156,10 +1284,10 @@ static void sm_combat_tick(StarMelee* env, int i) {
 static void sm_read_inputs(StarMelee* env) {
     for (int i = 0; i < env->num_ships; i++) {
         Ship* s = &env->ships[i];
-        int left = env->actions[i*4 + 0] > 0.5f;
-        int right = env->actions[i*4 + 1] > 0.5f;
-        int engine = env->actions[i*4 + 2] > 0.5f;
-        int fire = env->actions[i*4 + 3] > 0.5f;
+        int left = env->action_ptr[i][0] > 0.5f;
+        int right = env->action_ptr[i][1] > 0.5f;
+        int engine = env->action_ptr[i][2] > 0.5f;
+        int fire = env->action_ptr[i][3] > 0.5f;
 
         // Jitter penalty: charge every button toggle so dithering (rapid
         // on/off switching a human would never produce) costs reward while
@@ -1168,7 +1296,7 @@ static void sm_read_inputs(StarMelee* env) {
             + (engine != s->thrusting) + (fire != s->firing);
         if (changes > 0 && env->input_change_penalty > 0.0f) {
             float jitter = env->input_change_penalty * (float)changes;
-            env->rewards[i] -= jitter;
+            *env->reward_ptr[i] -= jitter;
             s->episode_return -= jitter;
         }
         s->input_changes += changes;
@@ -1265,8 +1393,9 @@ static void sm_physics_tick(StarMelee* env) {
             // Pain cap: a terminal step already adds -1, and the trainer
             // clamps steps to [-1, 1]; uncapped pain just gets truncated
             float pain = -fminf(damage, 0.6f * env->hp_max) / env->hp_max
-                * sm_pain_scale(env, s);
-            env->rewards[i] += pain;
+                * (env->sparse_reward ? env->sparse_damage_taken_scale
+                                      : sm_pain_scale(env, s));
+            *env->reward_ptr[i] += pain;
             s->episode_return += pain;
         }
     }
@@ -1327,8 +1456,20 @@ static void sm_physics_tick(StarMelee* env) {
         if (env->combat) {
             sm_combat_tick(env, i);
             if (s->episode_tick >= env->max_ticks) {
-                // Surviving a duel to the buzzer is not a failure
-                sm_finish_ship(env, i, 0.0f, SM_RESULT_TIMEOUT);
+                // Dense: surviving to the buzzer is not a failure. Sparse:
+                // the timeout charge is a cowardice tax — scaled by the
+                // fraction of the round spent OUT of contact, so a ship that
+                // fought all round pays nothing at the buzzer while a ship
+                // that hid across the torus pays full. A flat draw penalty
+                // taught avoidance: it charged the fighter and the drifter
+                // alike, and drifting was the safer way to eat it.
+                float timeout_r = 0.0f;
+                if (env->sparse_reward && s->episode_tick > 0) {
+                    float out_frac = 1.0f
+                        - (float)s->ticks_in_contact / (float)s->episode_tick;
+                    timeout_r = -env->sparse_timeout_penalty * out_frac;
+                }
+                sm_finish_ship(env, i, timeout_r, SM_RESULT_TIMEOUT);
             }
             continue;
         }
@@ -1337,7 +1478,7 @@ static void sm_physics_tick(StarMelee* env) {
         float shaped = env->progress_scale * (s->prev_goal_dist - gdist) / env->size
             + env->step_penalty;
         s->prev_goal_dist = gdist;
-        env->rewards[i] += shaped;
+        *env->reward_ptr[i] += shaped;
         s->episode_return += shaped;
 
         if (gdist <= env->goal_radius) {
@@ -1350,8 +1491,8 @@ static void sm_physics_tick(StarMelee* env) {
 
 void c_step(StarMelee* env) {
     for (int i = 0; i < env->num_ships; i++) {
-        env->rewards[i] = 0.0f;
-        env->terminals[i] = 0.0f;
+        *env->reward_ptr[i] = 0.0f;
+        *env->terminal_ptr[i] = 0.0f;
     }
     for (int i = 0; i < env->num_ships; i++) {
         env->ships[i].just_finished = 0;
@@ -1596,7 +1737,7 @@ void c_render(StarMelee* env) {
         env->trail_idx[i] = (env->trail_idx[i] + 1) % STARMELEE_TRAIL_LEN;
         env->trails[i][env->trail_idx[i]] = (Vector2){s->x, s->y};
         if (env->trail_count[i] < STARMELEE_TRAIL_LEN) env->trail_count[i] += 1;
-        if (env->terminals != NULL && env->terminals[i] > 0.5f) {
+        if (env->terminal_ptr[i] != NULL && *env->terminal_ptr[i] > 0.5f) {
             env->trail_count[i] = 0;  // break the trail on respawn
         }
         for (int t = 1; t < env->trail_count[i]; t++) {

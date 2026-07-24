@@ -7,7 +7,23 @@
 
 #define Env StarMelee
 #define MY_VEC_INIT
+#define MY_USES_PERM
+#define MY_USES_TAGS
 #include "vecenv.h"
+
+// Selfplay-pool routing: write per-slot pointers into the global vec buffers,
+// respecting agent_perm if set (selfplay re-routes logical slots into specific
+// physical rows so banks own contiguous ranges). Identity perm = adjacent
+// slot_base + s layout — matches single-agent / bot-mode runs.
+void my_setup_perm(StaticVec* vec, Env* env, int slot_base) {
+    for (int s = 0; s < env->num_agents; s++) {
+        int phys = vec->agent_perm ? vec->agent_perm[slot_base + s] : (slot_base + s);
+        env->obs_ptr[s]      = (float*)vec->observations + (size_t)phys * OBS_SIZE;
+        env->action_ptr[s]   = vec->actions + (size_t)phys * NUM_ATNS;
+        env->reward_ptr[s]   = vec->rewards + phys;
+        env->terminal_ptr[s] = vec->terminals + phys;
+    }
+}
 
 // Same layout as the default my_vec_init in vecenv.h, plus fail-fast checks:
 // slots are assigned in fixed agents_per_buffer blocks, so num_ships must
@@ -112,6 +128,11 @@ void my_init(Env* env, Dict* kwargs) {
     env->asteroid_speed_max = (float)dict_get(kwargs, "asteroid_speed_max")->value;
     env->asteroid_respawn_ticks = (int)dict_get(kwargs, "asteroid_respawn_ticks")->value;
     env->danger_hp_weight = (float)dict_get(kwargs, "danger_hp_weight")->value;
+    env->sparse_reward = (int)dict_get(kwargs, "sparse_reward")->value;
+    env->sparse_kill_reward = (float)dict_get(kwargs, "sparse_kill_reward")->value;
+    env->sparse_damage_scale = (float)dict_get(kwargs, "sparse_damage_scale")->value;
+    env->sparse_damage_taken_scale = (float)dict_get(kwargs, "sparse_damage_taken_scale")->value;
+    env->sparse_timeout_penalty = (float)dict_get(kwargs, "sparse_timeout_penalty")->value;
     c_init(env);
 }
 
@@ -132,4 +153,29 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "retreats", log->retreats);
     dict_set(out, "asteroid_hits", log->asteroid_hits);
     dict_set(out, "asteroid_kills", log->asteroid_kills);
+    dict_set(out, "contact_frac", log->contact_frac);
+    // Selfplay-pool duel accounting. selfplay.py reads hist_score_bank_<b> /
+    // hist_n_bank_<b> per bank to drive swap decisions. Legacy aggregate
+    // hist_score / hist_n sum across all banks for backward-compat dashboards.
+    dict_set(out, "hist_score", log->hist_score);
+    dict_set(out, "hist_n", log->hist_n);
+    dict_set(out, "hist_score_bank_0", log->hist_score_bank[0]);
+    dict_set(out, "hist_score_bank_1", log->hist_score_bank[1]);
+    dict_set(out, "hist_score_bank_2", log->hist_score_bank[2]);
+    dict_set(out, "hist_score_bank_3", log->hist_score_bank[3]);
+    dict_set(out, "hist_score_bank_4", log->hist_score_bank[4]);
+    dict_set(out, "hist_score_bank_5", log->hist_score_bank[5]);
+    dict_set(out, "hist_score_bank_6", log->hist_score_bank[6]);
+    dict_set(out, "hist_score_bank_7", log->hist_score_bank[7]);
+    dict_set(out, "hist_n_bank_0", log->hist_n_bank[0]);
+    dict_set(out, "hist_n_bank_1", log->hist_n_bank[1]);
+    dict_set(out, "hist_n_bank_2", log->hist_n_bank[2]);
+    dict_set(out, "hist_n_bank_3", log->hist_n_bank[3]);
+    dict_set(out, "hist_n_bank_4", log->hist_n_bank[4]);
+    dict_set(out, "hist_n_bank_5", log->hist_n_bank[5]);
+    dict_set(out, "hist_n_bank_6", log->hist_n_bank[6]);
+    dict_set(out, "hist_n_bank_7", log->hist_n_bank[7]);
+    // Per-slot scores — match() reads slot_0_score / slot_1_score as A/B win rates.
+    dict_set(out, "slot_0_score", log->slot_0_score);
+    dict_set(out, "slot_1_score", log->slot_1_score);
 }

@@ -96,6 +96,10 @@ def main():
     if ckpt == 'latest':
         candidates = glob.glob(
             os.path.join('checkpoints', 'starmelee', '**', '*.bin'), recursive=True)
+        # Selfplay pool snapshots are opponents, not the trained primary —
+        # the run-start bootstrap in particular may be untrained weights.
+        candidates = [c for c in candidates
+            if os.path.basename(os.path.dirname(c)) != 'pool']
         if not candidates:
             sys.exit('No checkpoints under checkpoints/starmelee/')
         ckpt = max(candidates, key=os.path.getctime)
