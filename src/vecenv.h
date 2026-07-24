@@ -173,11 +173,9 @@ static inline size_t obs_element_size(void) {
 #define  STRINGIFY(x)  _STRINGIFY(x)
 const char dtype_symbol[] = STRINGIFY(OBS_TENSOR_T);
 
-#include <omp.h>
 #include <stdatomic.h>
-#include <pthread.h>
 #include <stdbool.h>
-#include <time.h>
+#include "puffer_os.h"  // pthreads, clock_gettime (POSIX passthrough / Windows shim)
 
 // Forward declare CUDA types and functions to avoid conflicts with raylib's float3
 typedef int cudaError_t;
@@ -235,6 +233,89 @@ typedef struct StaticOMPArg {
     thread_init_fn thread_init;
 } StaticOMPArg;
 
+#ifndef _OPENMP
+// The Windows Python extension is built WITHOUT OpenMP (torch ships its own
+// OpenMP runtime; loading a second one aborts with OMP Error #15), which
+// silently turns the `omp parallel for` env-step below into a single-core
+// loop per buffer — the whole rollout then bottlenecks on one thread.
+// This hand-rolled pool restores intra-buffer parallelism with the pthread
+// shim + C11 atomics: sub-workers pull env indices off an atomic cursor,
+// released once per step by a generation bump. Waits are hard spins, same
+// as the driver threads elsewhere in this file — idle cores are cheap next
+// to a stalled GPU pipeline.
+typedef struct StaticEnvPool {
+    StaticVec* vec;
+    int env_start;
+    int env_end;
+    atomic_int next_env;   // work-queue cursor; parked at env_end
+    atomic_int done;       // sub-workers finished with the current generation
+    atomic_int gen;        // step generation; a bump releases the sub-workers
+    atomic_int shutdown;
+    int num_subs;
+    pthread_t subs[64];
+} StaticEnvPool;
+
+static void static_env_pool_drain(StaticEnvPool* pool) {
+    Env* envs = (Env*)pool->vec->envs;
+    int i;
+    while ((i = atomic_fetch_add(&pool->next_env, 1)) < pool->env_end) {
+        c_step(&envs[i]);
+    }
+}
+
+static void* static_env_pool_sub(void* arg) {
+    StaticEnvPool* pool = (StaticEnvPool*)arg;
+    int seen = atomic_load(&pool->gen);
+    while (true) {
+        int g;
+        while ((g = atomic_load(&pool->gen)) == seen) {
+            if (atomic_load(&pool->shutdown)) {
+                return NULL;
+            }
+        }
+        seen = g;
+        static_env_pool_drain(pool);
+        atomic_fetch_add(&pool->done, 1);
+    }
+}
+
+static StaticEnvPool* static_env_pool_create(StaticVec* vec, int env_start,
+        int env_end, int num_workers) {
+    StaticEnvPool* pool = (StaticEnvPool*)calloc(1, sizeof(StaticEnvPool));
+    pool->vec = vec;
+    pool->env_start = env_start;
+    pool->env_end = env_end;
+    pool->num_subs = num_workers - 1;
+    if (pool->num_subs < 0) pool->num_subs = 0;
+    if (pool->num_subs > 64) pool->num_subs = 64;
+    atomic_store(&pool->next_env, env_end);  // parked: no work yet
+    for (int w = 0; w < pool->num_subs; w++) {
+        pthread_create(&pool->subs[w], NULL, static_env_pool_sub, pool);
+    }
+    return pool;
+}
+
+// One parallel env sweep. Ordering matters: the cursor must be rearmed
+// before the generation bump that releases the sub-workers (seq_cst
+// atomics make the store visible), and returning only after every
+// sub-worker reports done keeps generations from overlapping.
+static void static_env_pool_step(StaticEnvPool* pool) {
+    atomic_store(&pool->done, 0);
+    atomic_store(&pool->next_env, pool->env_start);
+    atomic_fetch_add(&pool->gen, 1);
+    static_env_pool_drain(pool);  // the driver thread works too
+    while (atomic_load(&pool->done) != pool->num_subs) {}
+}
+
+static void static_env_pool_destroy(StaticEnvPool* pool) {
+    atomic_store(&pool->shutdown, 1);
+    for (int w = 0; w < pool->num_subs; w++) {
+        pthread_join(pool->subs[w], NULL);
+    }
+    free(pool);
+}
+#endif
+
 // OMP thread manager
 static void* static_omp_threadmanager(void* arg) {
     StaticOMPArg* worker_arg = (StaticOMPArg*)arg;
@@ -259,11 +340,20 @@ static void* static_omp_threadmanager(void* arg) {
     if (num_workers < 1) num_workers = 1;
 
     Env* envs = (Env*)vec->envs;
+    (void)envs;  // unused when the env-pool path replaces the omp loop
+
+#ifndef _OPENMP
+    StaticEnvPool* env_pool = static_env_pool_create(vec, env_start,
+        env_start + env_count, num_workers);
+#endif
 
     printf("Num workers: %d\n", num_workers);
     while (true) {
         while (atomic_load(&buffer_states[buf]) != OMP_RUNNING) {
             if (atomic_load(&threading->shutdown)) {
+#ifndef _OPENMP
+                static_env_pool_destroy(env_pool);
+#endif
                 return NULL;
             }
         }
@@ -288,10 +378,14 @@ static void* static_omp_threadmanager(void* arg) {
             memset(&vec->rewards[agent_start], 0, agents_per_buffer * sizeof(float));
             memset(&vec->terminals[agent_start], 0, agents_per_buffer * sizeof(float));
             clock_gettime(CLOCK_MONOTONIC, &t0);
+#ifdef _OPENMP
             #pragma omp parallel for schedule(static) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
                 c_step(&envs[i]);
             }
+#else
+            static_env_pool_step(env_pool);
+#endif
             clock_gettime(CLOCK_MONOTONIC, &t1);
             my_accum[EVAL_ENV_STEP] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
 

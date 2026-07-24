@@ -419,8 +419,8 @@ struct Allocator {
     AllocEntry* regs = nullptr;
     int num_regs = 0;
     void* mem = nullptr;
-    long total_elems = 0;
-    long total_bytes = 0;
+    int64_t total_elems = 0;  // not long: 32-bit on Windows, arenas can pass 2GB
+    int64_t total_bytes = 0;
 };
 
 static void alloc_register_impl(Allocator* alloc, void** data_ptr, int64_t* shape, int elem_size) {
@@ -438,7 +438,10 @@ void alloc_register(Allocator* a, FloatTensor* t) {
     alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(float));
 }
 void alloc_register(Allocator* a, LongTensor* t) {
-    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(long));
+    // LongTensor.data is int64_t*; sizeof(long) is 4 on Windows (LLP64),
+    // which half-sizes the slot and lets int64 writes corrupt the next
+    // tensor in the arena (act_sizes_puf sat right after rng_offset_puf).
+    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(int64_t));
 }
 void alloc_register(Allocator* a, IntTensor* t) {
     alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(int));
@@ -449,7 +452,7 @@ cudaError_t alloc_create(Allocator* alloc) {
     cudaError_t err = cudaMalloc(&alloc->mem, alloc->total_bytes);
     if (err != cudaSuccess) return err;
     cudaMemset(alloc->mem, 0, alloc->total_bytes);
-    long offset = 0;
+    int64_t offset = 0;
     for (int i = 0; i < alloc->num_regs; i++) {
         offset = (offset + 15) & ~15;
         *alloc->regs[i].data_ptr = (char*)alloc->mem + offset;

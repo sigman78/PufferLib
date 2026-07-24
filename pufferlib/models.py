@@ -106,6 +106,8 @@ class MinGRU(nn.Module):
     # https://arxiv.org/abs/2410.01201v1
     def __init__(self, hidden_size, num_layers=1, **kwargs):
         super().__init__()
+        # Sweep-written configs store num_layers as a float (e.g. 2.11327)
+        num_layers = int(num_layers)
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.layers = nn.ModuleList([
